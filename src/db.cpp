@@ -11,13 +11,30 @@ using namespace std::chrono_literals;
 // ----------------------------------------------------
 // Free-function wrappers for atomic ops on shared_ptr
 // ----------------------------------------------------
-// Free-function wrappers for atomic ops on shared_ptr
+/**
+ * Atomically loads a shared_ptr with acquire memory ordering.
+ * 
+ * Used for RCU-style lock-free reads. The acquire ordering ensures
+ * that all writes to the pointed-to object are visible after this load.
+ * 
+ * @param p Pointer to the atomic shared_ptr to load
+ * @return A copy of the shared_ptr with acquire semantics
+ */
 template <typename T>
 static std::shared_ptr<T> atomic_load_ptr(const std::shared_ptr<T>* p) {
     // libc++ provides atomic_load_explicit(shared_ptr<T> const*, memory_order)
     return std::atomic_load_explicit(p, std::memory_order_acquire);
 }
 
+/**
+ * Atomically stores a shared_ptr with release memory ordering.
+ * 
+ * Used for RCU-style lock-free writes. The release ordering ensures
+ * that all writes to the pointed-to object are visible before this store.
+ * 
+ * @param p Pointer to the atomic shared_ptr to update
+ * @param v The new shared_ptr value to store
+ */
 template <typename T>
 static void atomic_store_ptr(std::shared_ptr<T>* p, std::shared_ptr<T> v) {
     // libc++ provides atomic_store_explicit(shared_ptr<T>*, shared_ptr<T>, memory_order)
@@ -28,6 +45,12 @@ static void atomic_store_ptr(std::shared_ptr<T>* p, std::shared_ptr<T> v) {
 // Sorting helpers for Layout levels
 // ----------------------------------------------------
 
+/**
+ * Sorts FileEntries in a specific level by their min_key.
+ * 
+ * This enables efficient binary search during point lookups and
+ * range pruning during scans. Must be called after modifying a level.
+ */
 void ZenithDB::sort_level_by_min_key(Layout& layout, std::size_t level) {
     if (level >= layout.levels.size()) return;
     auto& vec = layout.levels[level];
@@ -37,6 +60,12 @@ void ZenithDB::sort_level_by_min_key(Layout& layout, std::size_t level) {
               });
 }
 
+/**
+ * Sorts all levels in the layout by min_key.
+ * 
+ * Convenience function to ensure proper ordering across all levels
+ * after bulk operations like recovery or major compactions.
+ */
 void ZenithDB::sort_all_levels_by_min_key(Layout& layout) {
     for (std::size_t lvl = 0; lvl < layout.levels.size(); ++lvl) {
         sort_level_by_min_key(layout, lvl);
@@ -47,6 +76,12 @@ void ZenithDB::sort_all_levels_by_min_key(Layout& layout) {
 // Constructor / Destructor
 // ----------------------------------------------------
 
+/**
+ * Constructs and initializes a ZenithDB instance.
+ * 
+ * Performs full database recovery including WAL replay, manifest loading,
+ * and SSTable reconstruction. Starts the background worker thread.
+ */
 ZenithDB::ZenithDB(const std::string& dir)
     : data_dir_(dir),
       manifest_(data_dir_) {
@@ -97,6 +132,11 @@ ZenithDB::ZenithDB(const std::string& dir)
     worker_ = std::thread(&ZenithDB::background_worker, this);
 }
 
+/**
+ * Destructor that gracefully shuts down the database.
+ * 
+ * Stops background operations, syncs WAL, and cleans up resources.
+ */
 ZenithDB::~ZenithDB() {
     stop_.store(true, std::memory_order_release);
     if (worker_.joinable()) {
@@ -113,6 +153,13 @@ ZenithDB::~ZenithDB() {
 // Writes
 // ----------------------------------------------------
 
+/**
+ * Inserts or updates a key-value pair.
+ * 
+ * Writes are fast because they only touch memory (memtable + WAL).
+ * When the memtable grows too large, it's automatically frozen and
+ * a new one is created. Frozen memtables are flushed in the background.
+ */
 void ZenithDB::put(const std::string& key, const std::string& value) {
     std::lock_guard<std::mutex> lk(writer_mutex_);
 
@@ -144,6 +191,12 @@ void ZenithDB::put(const std::string& key, const std::string& value) {
     }
 }
 
+/**
+ * Deletes a key by inserting a tombstone.
+ * 
+ * The tombstone will hide the key immediately and eventually
+ * cause it to be removed during compaction.
+ */
 void ZenithDB::remove(const std::string& key) {
     std::lock_guard<std::mutex> lk(writer_mutex_);
 
@@ -177,6 +230,13 @@ void ZenithDB::remove(const std::string& key) {
 // Reads
 // ----------------------------------------------------
 
+/**
+ * Performs a point lookup for a key.
+ * 
+ * Uses range pruning to skip memtables and SSTables that cannot
+ * contain the key, and bloom filters to quickly reject SSTables.
+ * Lock-free for readers using RCU semantics.
+ */
 std::optional<std::string> ZenithDB::get(const std::string& key) const {
     // 1) Active memtable (range-aware)
     {
@@ -248,6 +308,12 @@ std::optional<std::string> ZenithDB::get(const std::string& key) const {
 
     return std::nullopt;
 }
+/**
+ * Performs a range scan over keys.
+ * 
+ * Searches all memtables and SSTables, merges results, deduplicates
+ * by key (keeping latest), and filters tombstones. Results are sorted.
+ */
 std::vector<std::pair<std::string, std::string>> ZenithDB::scan(
     const std::string& start,
     const std::string& end) const
@@ -319,6 +385,16 @@ std::vector<std::pair<std::string, std::string>> ZenithDB::scan(
 // Background worker & compaction
 // ----------------------------------------------------
 
+/**
+ * Background worker thread that handles flushing and compaction.
+ * 
+ * Runs in a loop, periodically:
+ * 1. Flushing immutable memtables to Level 0
+ * 2. Compacting levels that exceed their thresholds
+ * 3. Publishing new RCU layout snapshots
+ * 
+ * Uses writer_mutex_ to serialize all write-side operations.
+ */
 void ZenithDB::background_worker() {
     while (!stop_.load(std::memory_order_acquire)) {
         // Snapshot current layout
@@ -394,6 +470,11 @@ void ZenithDB::background_worker() {
 // Helpers
 // ----------------------------------------------------
 
+/**
+ * Generates a unique SSTable filename.
+ * 
+ * Format ensures uniqueness and includes level number for organization.
+ */
 std::string ZenithDB::new_filename(int level) {
     static std::atomic<std::uint64_t> counter{0};
     auto id = counter.fetch_add(1, std::memory_order_relaxed);

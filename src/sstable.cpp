@@ -28,6 +28,15 @@ static constexpr std::size_t   FOOTER_SIZE = 32;  // 4 * uint64_t
 //  Bloom hash helpers (shared between create() and may_contain())
 // =====================================================================
 
+/**
+ * Core hash function using FNV-1a algorithm.
+ * 
+ * FNV-1a is a fast, non-cryptographic hash function that provides
+ * good distribution for bloom filters.
+ * 
+ * @param k The key to hash
+ * @return 64-bit hash value
+ */
 static inline std::uint64_t bloom_hash_core(const std::string& k) {
     // FNV-1a 64-bit
     std::uint64_t h = 1469598103934665603ULL;
@@ -38,17 +47,35 @@ static inline std::uint64_t bloom_hash_core(const std::string& k) {
     return h;
 }
 
-// free function used in create()
+/**
+ * Generates multiple hash values for bloom filter.
+ * 
+ * Uses the core hash with different offsets to generate independent
+ * hash functions for the bloom filter.
+ * 
+ * @param k The key to hash
+ * @param i The hash function index
+ * @return Hash value for this hash function
+ */
 static inline std::uint64_t bloom_hash_static(const std::string& k, int i) {
     std::uint64_t base = bloom_hash_core(k);
     return base + static_cast<std::uint64_t>(i) * 0x9e3779b97f4a7c15ULL;
 }
 
+/**
+ * Member function version of bloom hash (used by may_contain).
+ */
 std::uint64_t SSTable::bloom_hash(const std::string& k, int i) const {
     std::uint64_t base = bloom_hash_core(k);
     return base + static_cast<std::uint64_t>(i) * 0x9e3779b97f4a7c15ULL;
 }
 
+/**
+ * Checks if a key might be in this SSTable using the bloom filter.
+ * 
+ * Returns false only if the key is definitely not present (no false negatives).
+ * Returns true if the key might be present (may have false positives).
+ */
 bool SSTable::may_contain(const std::string& key) const {
     // No bloom region → say "maybe yes"
     if (bloom_offset_ == 0 || index_offset_ <= bloom_offset_) {
@@ -79,6 +106,16 @@ bool SSTable::may_contain(const std::string& key) const {
 //  Small helper: compare key span (ptr,len) vs std::string
 // =====================================================================
 
+/**
+ * Compares a key stored as (pointer, length) with a std::string.
+ * 
+ * Used to avoid allocating strings when comparing keys during block scans.
+ * 
+ * @param a Pointer to the first key
+ * @param alen Length of the first key
+ * @param b The second key as a string
+ * @return <0 if a < b, 0 if a == b, >0 if a > b
+ */
 static int compare_key_span_to_string(const char* a, std::uint32_t alen,
                                       const std::string& b) {
     std::size_t blen = b.size();
@@ -97,6 +134,12 @@ static int compare_key_span_to_string(const char* a, std::uint32_t alen,
 //  Constructor & footer/index parsing
 // =====================================================================
 
+/**
+ * Constructs an SSTable by loading it from disk.
+ * 
+ * Attempts to load from BlockCache first, otherwise reads from disk
+ * and caches it. Then parses the footer and index.
+ */
 SSTable::SSTable(const std::filesystem::path& p) {
     const std::string key = p.string();
 
@@ -133,6 +176,13 @@ SSTable::SSTable(const std::filesystem::path& p) {
     parse_footer_and_index();
 }
 
+/**
+ * Parses the footer and sparse index from the SSTable file.
+ * 
+ * Reads the footer at the end of the file, validates magic number,
+ * extracts offsets, and loads the sparse index. Also computes metadata
+ * like min_key, max_key, and entry_count by examining block headers.
+ */
 void SSTable::parse_footer_and_index() {
     const std::size_t sz   = data_.size();
     const char*       base = data_.data();
@@ -283,6 +333,17 @@ void SSTable::parse_footer_and_index() {
 //  Create SSTable (multi-block layout + sparse index + bloom + footer)
 // =====================================================================
 
+/**
+ * Creates a new SSTable file from sorted key-value entries.
+ * 
+ * Builds a multi-block SSTable with:
+ * 1. Data blocks (target 4KB each) containing sorted entries
+ * 2. Sparse index mapping block min_keys to offsets
+ * 3. Bloom filter over all keys
+ * 4. Footer with metadata and offsets
+ * 
+ * The entries must be sorted by key and have no duplicates.
+ */
 void SSTable::create(
     const std::filesystem::path& path,
     const std::vector<std::pair<std::string, std::string>>& entries_in)
@@ -428,6 +489,12 @@ void SSTable::create(
 //  Block-level helpers (optimized for fewer allocations)
 // =====================================================================
 
+/**
+ * Searches for a key within a specific data block.
+ * 
+ * Parses the block header, then performs linear search through entries.
+ * Since entries are sorted, can stop early if we pass the key.
+ */
 std::optional<std::string> SSTable::find_in_block(
     std::uint64_t offset,
     const std::string& key) const
@@ -485,6 +552,12 @@ std::optional<std::string> SSTable::find_in_block(
     return std::nullopt;
 }
 
+/**
+ * Scans a data block for keys in the specified range.
+ * 
+ * Parses the block and collects all entries where start <= key <= end.
+ * Can stop early if we pass the end key (since entries are sorted).
+ */
 void SSTable::scan_block(
     std::uint64_t offset,
     const std::string& start,
@@ -549,6 +622,13 @@ void SSTable::scan_block(
 //  Public get()/scan() using sparse index
 // =====================================================================
 
+/**
+ * Performs a point lookup using bloom filter and sparse index.
+ * 
+ * First checks the bloom filter to quickly reject keys that aren't present.
+ * Then uses binary search on the sparse index to find the relevant block,
+ * then searches within that block.
+ */
 std::optional<std::string> SSTable::get(const std::string& key) const {
     // Bloom-based quick negative check
     if (!may_contain(key)) {
@@ -579,6 +659,12 @@ std::optional<std::string> SSTable::get(const std::string& key) const {
     return find_in_block(it->offset, key);
 }
 
+/**
+ * Performs a range scan using range metadata and sparse index.
+ * 
+ * Uses min_key/max_key to skip irrelevant files, then uses the sparse
+ * index to find relevant blocks, then scans those blocks.
+ */
 std::vector<std::pair<std::string, std::string>> SSTable::scan(
     const std::string& start,
     const std::string& end) const

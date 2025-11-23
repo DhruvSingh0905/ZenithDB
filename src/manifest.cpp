@@ -3,8 +3,14 @@
 #include <fstream>
 #include <sstream>
 
+/**
+ * Constructs a Manifest that uses "MANIFEST" file in the given directory.
+ */
 Manifest::Manifest(const std::filesystem::path& dir) : path_(dir / "MANIFEST") {}
 
+/**
+ * Appends an "ADD" record to the manifest log.
+ */
 void Manifest::add_sstable(int level, const std::string& filename) {
     std::ofstream out(path_, std::ios::app);
     if (out) {
@@ -12,6 +18,10 @@ void Manifest::add_sstable(int level, const std::string& filename) {
     }
 }
 
+/**
+ * Records file replacements by writing DEL records for old files
+ * and ADD records for new files.
+ */
 void Manifest::replace(int level,
                       const std::vector<std::string>& old_files,
                       const std::vector<std::string>& new_files) {
@@ -26,6 +36,12 @@ void Manifest::replace(int level,
     }
 }
 
+/**
+ * Loads the manifest and reconstructs the level structure.
+ * 
+ * Reads all ADD records and builds a vector of Level structures.
+ * DEL records are ignored during recovery (we only care about current state).
+ */
 std::vector<Level> Manifest::load() {
     std::vector<Level> levels(7);
 

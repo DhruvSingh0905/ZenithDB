@@ -3,6 +3,23 @@
 #include <map>
 #include <iostream>
 
+/**
+ * Compacts all SSTables in a level into the next level.
+ * 
+ * This function:
+ * 1. Collects all SSTables from the source level
+ * 2. Merges their key-value pairs (keeping latest value for duplicates)
+ * 3. Removes tombstones and their corresponding keys
+ * 4. Writes a new merged SSTable to the next level
+ * 5. Updates the manifest to record the file changes
+ * 6. Updates the layout with the new SSTable
+ * 
+ * Compaction reduces read amplification and reclaims space from
+ * deleted keys. It's triggered when a level exceeds its file threshold.
+ * 
+ * @param level The level to compact (must be < levels_meta_.size() - 1)
+ * @param layout The layout snapshot to update with new SSTable entries
+ */
 void ZenithDB::compact_level(int level, Layout& layout) {
     if (level < 0 ||
         static_cast<std::size_t>(level + 1) >= levels_meta_.size()) {

@@ -9,6 +9,9 @@
 #include <cstring>
 #include <cerrno>
 
+/**
+ * Opens or creates the WAL file in append mode.
+ */
 WAL::WAL(const std::filesystem::path& dir) {
     std::filesystem::create_directories(dir);
     path_ = dir / "wal.log";
@@ -19,6 +22,9 @@ WAL::WAL(const std::filesystem::path& dir) {
     }
 }
 
+/**
+ * Syncs the WAL to disk and closes the file.
+ */
 WAL::~WAL() {
     if (fd_ != -1) {
         sync();
@@ -26,6 +32,12 @@ WAL::~WAL() {
     }
 }
 
+/**
+ * Appends a record to the WAL file.
+ * 
+ * Writes the record with a newline. The write may be buffered by the OS;
+ * call sync() to ensure durability.
+ */
 void WAL::append(const std::string& record) {
     std::string line = record + "\n";
     ssize_t written = write(fd_, line.data(), line.size());
@@ -34,12 +46,21 @@ void WAL::append(const std::string& record) {
     }
 }
 
+/**
+ * Forces all buffered WAL data to disk using fsync().
+ */
 void WAL::sync() {
     if (fd_ != -1) {
         ::fsync(fd_);          // :: to avoid any name clash
     }
 }
 
+/**
+ * Replays the WAL to reconstruct the memtable.
+ * 
+ * Reads all records from the WAL and applies PUT/DEL operations
+ * to the given memtable. Used during database recovery.
+ */
 void WAL::replay(MemTable* memtable) {
     if (lseek(fd_, 0, SEEK_SET) == -1) {
         return;  // empty or error

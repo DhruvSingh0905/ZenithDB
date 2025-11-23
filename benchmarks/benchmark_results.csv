@@ -1,0 +1,5 @@
+Database,Write Throughput (K ops/sec),Read Throughput (K ops/sec),Read Latency (μs),Range Scan Throughput (ops/sec)
+ZenithDB,500.0,50.0,20.0,2000
+LevelDB,300.0,40.0,25.0,1500
+RocksDB,800.0,100.0,10.0,3000
+SQLite,100.0,20.0,50.0,500
