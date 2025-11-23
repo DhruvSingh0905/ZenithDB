@@ -1,0 +1,61 @@
+# ----------------------------------------
+# ZenithDB — Build artifacts & temp files
+# ----------------------------------------
+
+# CMake build directories
+build/
+cmake-build*/
+CMakeFiles/
+CMakeCache.txt
+Makefile
+*.cmake
+
+# Benchmark output directories
+bench_db/
+bench/
+*.sst
+*.db
+*.ldb
+*.sstable
+*.manifest
+
+# WAL and log files
+*.log
+wal.log
+wal/
+log/
+*.trace
+
+# Compiled binaries
+zenithdb
+zenithdb_bench
+tests
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+
+# IDE / editor junk
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Crash dumps
+*.core
+*.tmp
+*.temp
+
+# Python virtual envs (if you ever run scripts)
+env/
+venv/
+
+# Backup files
+*~
+*.bak
+*.old
