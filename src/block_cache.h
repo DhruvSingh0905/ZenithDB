@@ -1,52 +1,123 @@
+// src/block_cache.h
 #pragma once
+
 #include <unordered_map>
 #include <list>
-#include <string>
+#include <memory>
 #include <mutex>
+#include <string>
 
+// Very simple global LRU block cache.
+//
+// Key:   usually "<file_id>:<block_offset>"
+// Value: shared_ptr<string> holding the block's bytes
 class BlockCache {
 public:
-    // 16 MB total capacity, assuming 4 KB blocks → 4096 blocks
-    static constexpr size_t MAX_BLOCKS = 4096;
+    using Block      = std::string;
+    using BlockPtr   = std::shared_ptr<Block>;
+    using Key        = std::string;
 
-    // Return cached block for key, or empty string if not present.
-    std::string get(const std::string& key) {
+    // ~16MB cache by default, assuming ~4KB blocks → ~4000 blocks.
+    static constexpr std::size_t DEFAULT_CAP_BYTES = 16 * 1024 * 1024;
+
+    // Singleton accessor
+    static BlockCache& instance() {
+        static BlockCache inst;
+        return inst;
+    }
+
+    // Non-copyable
+    BlockCache(const BlockCache&) = delete;
+    BlockCache& operator=(const BlockCache&) = delete;
+
+    // Thread-safe LRU lookup.
+    //
+    // Returns nullptr if not found.
+    BlockPtr get(const Key& key) {
         std::lock_guard<std::mutex> lk(mutex_);
         auto it = map_.find(key);
-        if (it == map_.end()) return {};
+        if (it == map_.end()) {
+            return nullptr;
+        }
 
-        // Move this entry to front (most recently used)
+        // Move to front (most recently used)
         lru_.splice(lru_.begin(), lru_, it->second);
         return it->second->second;
     }
 
-    // Insert or update a block for key.
-    void put(const std::string& key, std::string value) {
+    // Thread-safe insert/update.
+    //
+    // If key already exists, updates value and bumps to MRU.
+    // If new key and capacity exceeded, evicts LRU entries until under cap.
+    void put(const Key& key, BlockPtr value) {
+        if (!value) return;
+        const std::size_t block_size = value->size();
+
         std::lock_guard<std::mutex> lk(mutex_);
 
         // Update existing
-        if (auto it = map_.find(key); it != map_.end()) {
-            lru_.splice(lru_.begin(), lru_, it->second);
+        auto it = map_.find(key);
+        if (it != map_.end()) {
+            current_bytes_ -= it->second->second->size();
             it->second->second = std::move(value);
+            current_bytes_ += block_size;
+
+            // move to front (MRU)
+            lru_.splice(lru_.begin(), lru_, it->second);
+            evict_if_needed();
             return;
         }
 
-        // Evict least-recently-used if full
-        if (lru_.size() >= MAX_BLOCKS) {
-            auto& back = lru_.back();
-            map_.erase(back.first);
-            lru_.pop_back();
-        }
-
-        // Insert new at front
+        // Insert new
         lru_.emplace_front(key, std::move(value));
         map_[key] = lru_.begin();
+        current_bytes_ += block_size;
+
+        evict_if_needed();
+    }
+
+    // Optional: for tuning / tests
+    void set_capacity(std::size_t bytes) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        capacity_bytes_ = bytes;
+        evict_if_needed();
+    }
+
+    std::size_t capacity_bytes() const {
+        std::lock_guard<std::mutex> lk(mutex_);
+        return capacity_bytes_;
+    }
+
+    std::size_t current_bytes() const {
+        std::lock_guard<std::mutex> lk(mutex_);
+        return current_bytes_;
     }
 
 private:
+    BlockCache() = default;
+
+    void evict_if_needed() {
+        while (current_bytes_ > capacity_bytes_ && !lru_.empty()) {
+            auto& back = lru_.back();
+            const auto& key  = back.first;
+            const auto& ptr  = back.second;
+            if (ptr) {
+                current_bytes_ -= ptr->size();
+            }
+            map_.erase(key);
+            lru_.pop_back();
+        }
+    }
+
     mutable std::mutex mutex_;
 
-    using Entry = std::pair<std::string, std::string>;
-    std::list<Entry> lru_;  // most recently used at front
-    std::unordered_map<std::string, std::list<Entry>::iterator> map_;
+    // LRU list of (key, block)
+    using ListType = std::list<std::pair<Key, BlockPtr>>;
+    ListType lru_;  // front = MRU, back = LRU
+
+    // Map from key → iterator into lru_
+    std::unordered_map<Key, ListType::iterator> map_;
+
+    std::size_t capacity_bytes_ = DEFAULT_CAP_BYTES;
+    std::size_t current_bytes_  = 0;
 };

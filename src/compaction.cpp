@@ -1,44 +1,85 @@
 #include "db.h"
-#include <algorithm>
-#include <set>
 
-void ZenithDB::compact_level(int level) {
-    if (level >= levels_.size() - 1) return;
+#include <map>
+#include <iostream>
 
-    auto& curr = levels_[level];
-    auto& next = levels_[level + 1];
-
-    if (curr.files.size() < curr.max_files) return;
-
-    // simple: take all files in level
-    std::vector<std::unique_ptr<SSTable>> tables;
-    for (const auto& f : curr.files) {
-        tables.emplace_back(std::make_unique<SSTable>(data_dir_ / f));
+void ZenithDB::compact_level(int level, Layout& layout) {
+    if (level < 0 ||
+        static_cast<std::size_t>(level + 1) >= levels_meta_.size()) {
+        return;
     }
 
-    std::vector<std::pair<std::string, std::string>> merged;
-    std::set<std::string> seen;
+    std::size_t threshold = (level == 0) ? 3 : 4;
+    if (levels_meta_[level].files.size() < threshold) {
+        return;
+    }
 
-    // merge + tombstone elimination
-    for (auto& table : tables) {
-        auto entries = table->scan("", "\xFF\xFF\xFF\xFF");
-        for (auto& [k, v] : entries) {
-            if (v.empty()) seen.insert(k);           // tombstone
-            else if (seen.find(k) == seen.end()) {
-                merged.emplace_back(k, v);
+    // Compact *all* SSTables in this level into the next level.
+    auto input_files = std::move(levels_meta_[level].files);
+    levels_meta_[level].files.clear();
+
+    auto& level_vec = layout.levels[level];
+
+    // Extract the SSTable pointers from FileEntry vector
+    std::vector<std::shared_ptr<SSTable>> input_ssts;
+    input_ssts.reserve(level_vec.size());
+    for (auto& fe : level_vec) {
+        if (fe.sst) {
+            input_ssts.push_back(std::move(fe.sst));
+        }
+    }
+    level_vec.clear();
+
+    // Merge all keys from these SSTables
+    std::map<std::string, std::string> merged;
+
+    for (const auto& sst : input_ssts) {
+        if (!sst) continue;
+        auto rows = sst->scan("", "\xFF\xFF\xFF\xFF");
+        for (auto& [k, v] : rows) {
+            if (v.empty()) {
+                merged.erase(k);  // tombstone
+            } else {
+                merged[k] = std::move(v);
             }
         }
     }
 
-    // remove tombstones
-    merged.erase(
-        std::remove_if(merged.begin(), merged.end(),
-            [&](auto& p) { return seen.count(p.first); }),
-        merged.end());
+    if (merged.empty()) {
+        // No live keys; drop these files in manifest
+        manifest_.replace(level, input_files, {});
+        return;
+    }
 
-    // write_new_level(level + 1, merged);
+    // Write merged SSTable into next level
+    std::string new_file = new_filename(level + 1);
 
-    manifest_.replace(level, curr.files, {});
-    manifest_.replace(level + 1, next.files, {new_filename(level + 1)});
-    curr.files.clear();
+    std::vector<std::pair<std::string, std::string>> vec;
+    vec.reserve(merged.size());
+    for (auto& kv : merged) {
+        vec.emplace_back(std::move(kv.first), std::move(kv.second));
+    }
+
+    SSTable::create(data_dir_ / new_file, vec);
+
+    levels_meta_[level + 1].files.push_back(new_file);
+    manifest_.add_sstable(level + 1, new_file);
+    manifest_.replace(level, input_files, {});
+
+    // Add to layout
+    if (layout.levels.size() <= static_cast<std::size_t>(level + 1)) {
+        layout.levels.resize(level + 2);
+    }
+
+    try {
+        auto sst = std::make_shared<SSTable>(data_dir_ / new_file);
+        Layout::FileEntry fe;
+        fe.sst     = sst;
+        fe.min_key = sst->meta().min_key;
+        fe.max_key = sst->meta().max_key;
+        layout.levels[level + 1].push_back(std::move(fe));
+    } catch (const std::exception& e) {
+        std::cerr << "[ZenithDB] Failed to open compacted SSTable "
+                  << new_file << ": " << e.what() << "\n";
+    }
 }

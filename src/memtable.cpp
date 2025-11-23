@@ -1,44 +1,60 @@
 #include "memtable.h"
 
+#include <algorithm>
+
+void MemTable::update_range(const std::string& key) {
+    if (!has_range_) {
+        min_key_   = key;
+        max_key_   = key;
+        has_range_ = true;
+    } else {
+        if (key < min_key_) min_key_ = key;
+        if (key > max_key_) max_key_ = key;
+    }
+}
+
 void MemTable::put(const std::string& key, const std::string& value) {
-    map_[key] = value;
+    // Simple approximate byte accounting: key + value
+    approx_bytes_ += key.size() + value.size();
+
+    data_[key] = value;
+    update_range(key);
 }
 
 void MemTable::remove(const std::string& key) {
-    map_[key] = TOMBSTONE;
+    // Tombstone as empty string; count a bit of size as well
+    approx_bytes_ += key.size() + 1;
+    data_[key] = std::string();  // empty -> tombstone
+    update_range(key);
 }
 
 std::optional<std::string> MemTable::get(const std::string& key) const {
-    auto it = map_.find(key);
-    if (it == map_.end() || it->second == TOMBSTONE) {
+    auto it = data_.find(key);
+    if (it == data_.end()) {
         return std::nullopt;
     }
-    return it->second;
+    return it->second;  // may be empty string (tombstone)
 }
 
-void MemTable::clear() {
-    map_.clear();
+std::vector<std::pair<std::string, std::string>> MemTable::scan(
+    const std::string& start,
+    const std::string& end) const
+{
+    std::vector<std::pair<std::string, std::string>> out;
+    if (start > end) return out;
+
+    auto it = data_.lower_bound(start);
+    for (; it != data_.end() && it->first <= end; ++it) {
+        out.emplace_back(it->first, it->second);
+    }
+    return out;
 }
 
 std::vector<std::pair<std::string, std::string>> MemTable::sorted_entries() const {
-    std::vector<std::pair<std::string, std::string>> vec;
-    for (const auto& [k, v] : map_) {
-        if (!v.empty()) vec.emplace_back(k, v);
+    std::vector<std::pair<std::string, std::string>> out;
+    out.reserve(data_.size());
+    for (const auto& kv : data_) {
+        out.push_back(kv);
     }
-    return vec;
-}
-
-size_t MemTable::approximate_size() const {
-    size_t s = 0;
-    for (const auto& [k, v] : map_) s += k.size() + v.size();
-    return s;
-}
-
-std::vector<std::pair<std::string, std::string>> MemTable::scan(const std::string& start, const std::string& end) const {
-    std::vector<std::pair<std::string, std::string>> res;
-    auto it = map_.lower_bound(start);
-    for (; it != map_.end() && it->first <= end; ++it) {
-        if (!it->second.empty()) res.emplace_back(it->first, it->second);
-    }
-    return res;
+    return out;
 }

@@ -20,6 +20,7 @@ add_library(zenithdb_lib STATIC
     src/wal.cpp
     src/sstable.cpp
     src/manifest.cpp
+    src/compaction.cpp
 )
 
 target_include_directories(zenithdb_lib PUBLIC src)
@@ -34,8 +35,15 @@ target_link_libraries(zenithdb PRIVATE zenithdb_lib)
 # Tests
 # ------------------------------
 add_executable(tests
-    tests/test_BF.cpp
+    tests/test_rcu_stress.cpp
+    tests/test_sstable_block_index.cpp
+
+
+)
+add_executable(zenithdb_bench
+    benchmarks/bench_zenithdb.cpp
 )
 
+target_link_libraries(zenithdb_bench PRIVATE zenithdb_lib)
 target_link_libraries(tests PRIVATE zenithdb_lib gtest_main gtest)
 gtest_discover_tests(tests)
