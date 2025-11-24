@@ -37,13 +37,14 @@ Measures write throughput for sequential key insertions.
 - ~2x write amplification (memtable + WAL)
 
 **Performance Factors:**
-- **Memtable writes**: O(log n) insertion into std::map
+- **Memtable writes**: O(log n) insertion into skip list (arena-allocated)
 - **WAL writes**: Sequential append (buffered, fast)
-- **Bottleneck**: Single writer mutex (deficit) limits multi-threaded throughput
+- **Bottleneck**: Mutex serialization (design choice) limits write throughput in high-concurrency scenarios
 - **Optimization**: Range metadata updates are O(1)
 
 **Low-Level Optimizations Impact:**
-- Transparent comparator enables efficient memtable operations
+- Arena allocator eliminates memory fragmentation and reduces allocation overhead
+- Skip list provides better cache locality than balanced trees
 - WAL buffering reduces system call overhead
 - Memtable size threshold (2x limit) reduces flush frequency
 
@@ -65,7 +66,7 @@ Measures read performance for random key lookups.
 - 10K-100K reads/sec (with cache)
 
 **Performance Factors:**
-- **Memtable lookups**: O(log n) with zero-allocation (transparent comparator)
+- **Memtable lookups**: O(log n) with skip list (lock-free reads, arena-allocated)
 - **SSTable lookups**: O(log(blocks) + log(n/16) + 16) with bloom filter pruning
 - **Memory-mapped files**: Zero-copy reads, OS page caching
 - **Range pruning**: Skips irrelevant data structures
@@ -130,7 +131,7 @@ Measures performance under mixed workload.
 
 **Performance Factors:**
 - **RCU**: Reads don't block writes (lock-free)
-- **Single writer**: Writes serialized (deficit)
+- **Serialized writes**: Writes thread-safe but serialized via mutex (supports multiple threads)
 - **Background compaction**: May cause temporary slowdowns
 
 **Low-Level Optimizations Impact:**
@@ -236,7 +237,7 @@ See the Jupyter notebook `benchmarks/stress_test.ipynb` for detailed comparisons
 - High read concurrency (RCU)
 
 **ZenithDB weaknesses:**
-- Single writer limits write throughput (deficit)
+- Mutex serialization limits write throughput (supports multiple threads, but not parallel)
 - No compression (higher disk usage)
 - Simple compaction (higher write amplification)
 - Limited error recovery
@@ -248,11 +249,11 @@ See the Jupyter notebook `benchmarks/stress_test.ipynb` for detailed comparisons
 **High throughput**: Good for write-heavy workloads
 - Memtable writes are fast (O(log n))
 - WAL writes are sequential (buffered)
-- Bottleneck: Single writer mutex (deficit)
+- Bottleneck: Mutex serialization (supports multiple threads, but not parallel)
 
 **Low latency**: Good for real-time applications
 - Typical: 1-10 μs per write
-- WAL not synced (reduces latency, but risk of data loss)
+- WAL sync configurable (default: async for lower latency, option: sync for durability)
 
 **Consistent**: Low variance is important
 - Compaction can cause latency spikes
@@ -300,8 +301,9 @@ See the Jupyter notebook `benchmarks/stress_test.ipynb` for detailed comparisons
 - Memory-mapped files handle concurrent access
 - Typical: Linear scaling up to CPU cores
 
-**Write contention**: Single writer limits throughput
-- Deficit: Single writer mutex
+**Write contention**: Mutex serialization limits throughput
+- Design choice: Mutex ensures thread-safe writes with consistent ordering
+- Supports multiple write threads, but writes are serialized (not parallel)
 - Multi-threaded writes don't scale
 - Better for single-threaded or low-concurrency write workloads
 
@@ -335,7 +337,7 @@ See the Jupyter notebook `benchmarks/stress_test.ipynb` for detailed comparisons
 
 1. **Write amplification**: Each write goes to memtable + WAL (~2x)
    - Acceptable trade-off for durability
-   - WAL not synced (deficit: risk of data loss)
+   - WAL sync configurable (default: async, option: sync for durability)
 
 2. **Read amplification**: May check multiple levels (~1-3x)
    - Range pruning and bloom filters reduce impact
@@ -346,8 +348,9 @@ See the Jupyter notebook `benchmarks/stress_test.ipynb` for detailed comparisons
    - Level 0 can grow unbounded
    - May cause read performance degradation
 
-4. **Single writer**: Limits write throughput
-   - Deficit: Single writer mutex
+4. **Serialized writes**: Limits write throughput in high-concurrency scenarios
+   - Design choice: Mutex ensures thread-safe writes with consistent ordering
+   - Supports multiple write threads, but writes are serialized (not parallel)
    - Multi-threaded writes don't scale
    - Better for single-threaded or low-concurrency workloads
 

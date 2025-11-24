@@ -3,9 +3,27 @@
 #include <iostream>
 #include <sstream>
 #include <vector>
+#include <thread>
+#include <atomic>
+
+// Thread function for concurrent writing
+void writer_thread(ZenithDB& db, int id, int count) {
+    for (int i = 0; i < count; ++i) {
+        std::string key = "thread:" + std::to_string(id) + ":k" + std::to_string(i);
+        std::string val = "value_from_thread_" + std::to_string(id);
+        db.put(key, val);
+    }
+}
 
 int main() {
-    ZenithDB db("mydb");        // folder will be created automatically
+    // Example usage: 
+    // ZenithDB db("mydb", true); // true for synchronous writes (slower, safer)
+    // ZenithDB db("mydb", false); // false for buffered writes (faster)
+    
+    ZenithDB db("mydb", false); // Default to fast/buffered
+
+    std::cout << "ZenithDB Console\n";
+    std::cout << "Commands: put <key> <value> | get <key> | del <key> | scan [<start> [<end>]] | stress | exit\n";
 
     std::string line;
     while (std::cout << "> " && std::getline(std::cin, line)) {
@@ -62,12 +80,25 @@ int main() {
                 std::cout << "(empty)\n";
             } else {
                 for (const auto& [k, v] : results) {
-                    std::cout << k << " → " << v << '\n';
+                    std::cout << k << " -> " << v << '\n';
                 }
             }
         }
+        else if (cmd == "stress") {
+            int threads = 4;
+            int ops_per_thread = 5000;
+            std::cout << "Starting stress test with " << threads << " threads, " << ops_per_thread << " ops each...\n";
+            
+            std::vector<std::thread> pool;
+            for(int i=0; i<threads; ++i) {
+                pool.emplace_back(writer_thread, std::ref(db), i, ops_per_thread);
+            }
+            
+            for(auto& t : pool) t.join();
+            std::cout << "Stress test complete.\n";
+        }
         else {
-            std::cout << "Commands: put <key> <value> | get <key> | del <key> | scan [<start> [<end>]] | exit\n";
+            std::cout << "Unknown command.\n";
         }
     }
     std::cout << "Bye!\n";

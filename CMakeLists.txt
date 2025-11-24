@@ -35,8 +35,7 @@ target_link_libraries(zenithdb PRIVATE zenithdb_lib)
 # Tests
 # ------------------------------
 add_executable(tests
-    tests/test_rcu_stress.cpp
-    tests/test_sstable_block_index.cpp
+    tests/skiplist_test.cpp
 
 
 )

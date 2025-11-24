@@ -46,15 +46,16 @@ Traditional B-trees require random disk I/O for both reads and writes. LSM-trees
 ```
 User calls db.put(key, value)
     │
-    ├─► [Writer Mutex Lock] ← Serializes writes (deficit: single writer)
+    ├─► [Writer Mutex Lock] ← Serializes writes (thread-safe, supports multiple threads)
     │
     ├─► Active MemTable.put(key, value)
-    │   └─► Updates std::map<std::string, std::string, std::less<>>
+    │   └─► Inserts into SkipList (lock-free, arena-allocated)
     │   └─► Updates range metadata (min_key, max_key)
-    │   └─► Increments size counter
+    │   └─► Size tracked via arena memory usage
     │
     ├─► WAL.append("PUT|key|value")
-    │   └─► Writes to wal.log file (buffered, not synced)
+    │   └─► Writes to wal.log file
+    │   └─► Optionally syncs if sync_writes_ enabled
     │
     └─► [Check if memtable too large]
         │
@@ -66,7 +67,8 @@ User calls db.put(key, value)
 ```
 
 **Key Optimizations:**
-- `std::less<>` transparent comparator enables zero-allocation lookups
+- Skip list provides O(log n) operations with better cache locality
+- Arena allocator eliminates memory fragmentation
 - Range metadata enables efficient pruning
 - Lock-free immutable chain insertion (no blocking)
 
@@ -339,7 +341,7 @@ const char* data = static_cast<const char*>(map);
 
 ### Read-Write Concurrency
 
-- **Writes**: Serialized with `writer_mutex_` (deficit: single writer)
+- **Writes**: Thread-safe, serialized with `writer_mutex_` (supports multiple threads, but serialized)
 - **Reads**: Fully concurrent, lock-free (RCU)
 - **Background**: Runs in separate thread, uses `writer_mutex_`
 
@@ -348,10 +350,12 @@ const char* data = static_cast<const char*>(map);
 1. **Writes are fast**: Only touch memory (memtable + WAL)
 2. **Reads don't block writes**: RCU allows concurrent access
 3. **Background work is separate**: Doesn't block user operations
+4. **Serialized writes**: Ensures consistent ordering and simpler correctness
+5. **Thread-safe API**: Multiple threads can call write methods concurrently
 
 ### Potential Issues
 
-1. **Write contention**: Single writer mutex limits write throughput (deficit)
+1. **Write contention**: Mutex serialization limits write throughput in high-concurrency scenarios
 2. **Memory growth**: Old layout snapshots kept until all readers release (minor)
 3. **Compaction lag**: Background thread may not keep up with writes (deficit: no backpressure)
 
@@ -412,16 +416,29 @@ Binary search on restart points, then linear scan.
 
 **Impact:** O(log(n/16) + 16) instead of O(n) for block search.
 
-### Transparent Comparator
+### Arena Allocator
 
-Zero-allocation lookups with `string_view`.
+Zero-fragmentation memory management for memtable.
 
 **Implementation:**
-- `std::map<std::string, std::string, std::less<>>`
-- `std::less<>` enables transparent comparison
-- `find()` and `lower_bound()` accept `string_view` directly
+- Custom `Arena` class allocates 4KB blocks
+- All memtable allocations from arena (nodes, keys, values)
+- Sequential allocations from current block (O(1))
+- Memory freed only when arena destroyed
 
-**Impact:** Eliminates temporary string allocations during lookups.
+**Impact:** Eliminates memory fragmentation, reduces allocation overhead, improves cache locality.
+
+### Lock-Free Skip List
+
+Efficient sorted storage for memtable.
+
+**Implementation:**
+- Custom `SkipList` class with probabilistic height
+- Atomic pointer operations for thread-safe reads
+- All nodes allocated from arena
+- O(log n) average-case operations
+
+**Impact:** Better concurrent read performance, improved cache locality, reduced memory overhead.
 
 ## Failure Recovery
 
@@ -455,14 +472,14 @@ On startup:
 
 ### Current Limitations
 
-1. **Single writer**: Write operations are serialized (deficit)
+1. **Serialized writes**: Write operations are serialized via mutex (supports multiple threads, but not parallel)
 2. **No compression**: SSTables stored uncompressed (deficit)
 3. **Simple compaction**: All files in level merged at once (deficit)
 4. **No transactions**: No ACID guarantees across multiple keys (deficit)
 5. **Memory leaks**: ImmNodes not reclaimed (deficit: intentional for simplicity)
 6. **No backpressure**: Compaction may lag behind writes (deficit)
 7. **Limited error recovery**: Corrupted files skipped (deficit)
-8. **WAL not synced**: Risk of data loss on crash (deficit)
+8. **WAL sync**: Configurable via constructor (sync_writes parameter)
 9. **Fixed thresholds**: Not tunable (deficit)
 10. **No column families**: Single namespace (deficit)
 
@@ -477,15 +494,23 @@ On startup:
 
 ## Known Deficits
 
-### 1. Single Writer Mutex
+### 1. Serialized Writes via Mutex
 
-**Issue:** All write operations serialized through single mutex.
+**Status:** Multiple write threads are supported, but writes are serialized.
 
-**Impact:** Limits write throughput, especially for multi-threaded workloads.
+**Implementation:**
+- Multiple threads can call `put()` and `remove()` concurrently
+- All write operations are serialized via `writer_mutex_` for thread safety
+- Writes are thread-safe but not parallel (mutex serialization)
 
-**Why:** Simplifies implementation and ensures correctness.
+**Impact:** Write throughput is limited by mutex contention in high-concurrency scenarios.
 
-**Better Approach:** Partition keys across multiple memtables, use per-partition locks.
+**Why:** Design choice for simplicity and correctness. Serialized writes ensure:
+- Consistent ordering of writes
+- Simpler WAL management
+- Thread-safe API without requiring external synchronization
+
+**Note:** The implementation supports concurrent write calls (as demonstrated in main.cpp stress test with 4 threads), but the mutex ensures only one write executes at a time. True parallel writes would require partitioning keys across multiple memtables and more complex coordination.
 
 ### 2. ImmNode Memory Leak
 
@@ -547,15 +572,18 @@ On startup:
 
 **Better Approach:** Add checksums, detailed logging, repair utilities.
 
-### 8. WAL Not Synced
+### 8. WAL Sync Configuration
 
-**Issue:** WAL buffered, only synced on shutdown.
+**Status:** Addressed - WAL sync is now configurable.
 
-**Impact:** Risk of data loss on crash.
+**Implementation:** 
+- Constructor parameter `sync_writes` controls WAL sync behavior
+- `sync_writes = false` (default): Buffered writes, synced on shutdown
+- `sync_writes = true`: Synced on every write for durability
 
-**Why:** Reduces write latency.
-
-**Better Approach:** Add configurable sync policy (every write, every N writes, etc.).
+**Trade-off:** 
+- Async writes: Lower latency, small risk of data loss on crash
+- Sync writes: Higher latency, guaranteed durability
 
 ### 9. No Backpressure
 

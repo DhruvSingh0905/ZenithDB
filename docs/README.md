@@ -22,7 +22,7 @@ ZenithDB follows the LSM-tree design pattern, similar to LevelDB and RocksDB. Th
 
 ### Write Path
 
-1. **Writes** → Active MemTable (in-memory, sorted map)
+1. **Writes** → Active MemTable (in-memory, skip list)
 2. **WAL** → Write-Ahead Log (durability guarantee)
 3. **MemTable Freeze** → When size exceeds threshold, memtable becomes immutable
 4. **Background Flush** → Immutable memtables are written to Level 0 SSTables
@@ -68,14 +68,22 @@ The main database class that coordinates all components.
 
 ### 2. MemTable (`memtable.h` / `memtable.cpp`)
 
-In-memory sorted key-value store using `std::map` with transparent comparator.
+In-memory sorted key-value store using lock-free skip list with arena allocator.
 
 **Features:**
-- Fast O(log n) insertions and lookups
+- Fast O(log n) insertions and lookups (skip list)
+- Lock-free reads for better concurrent performance
+- Zero memory fragmentation (arena allocator)
 - Range tracking (min_key, max_key) for pruning
-- Approximate size tracking for flush decisions
+- Accurate size tracking via arena memory usage
 - Tombstone support (empty value = deleted)
-- **Critical Optimization**: Uses `std::less<>` transparent comparator to enable zero-allocation lookups with `string_view`
+- **Critical Optimization**: Arena allocator eliminates heap fragmentation and reduces allocation overhead
+- **Critical Optimization**: Skip list provides better cache locality than balanced trees
+
+**Implementation:**
+- Uses `SkipList` for sorted key-value storage
+- Uses `Arena` allocator for all memory allocations
+- All nodes and key/value data allocated from arena (contiguous memory)
 
 **Lifecycle:**
 1. Created as active memtable
@@ -225,25 +233,50 @@ This section highlights the critical low-level optimizations implemented in Zeni
 - Memory usage grows with number of open SSTables
 - OS manages eviction (not application-controlled)
 
-### 3. Transparent Comparator for Zero-Allocation Lookups
+### 3. Arena Allocator for Zero-Fragmentation Memory Management
 
 **Implementation:**
-- Uses `std::map<std::string, std::string, std::less<>>` in MemTable
-- `std::less<>` enables transparent comparison
-- `find()` and `lower_bound()` accept `string_view` directly
+- Custom `Arena` class allocates memory in 4KB blocks
+- All memtable allocations (nodes, keys, values) from arena
+- Sequential allocations from current block (O(1) for most allocations)
+- Memory freed only when arena destroyed (no individual deallocation)
 
 **Benefits:**
-- No temporary string allocations during lookups
-- Significant performance improvement for read-heavy workloads
-- Reduces memory pressure and GC overhead
+- Zero memory fragmentation (all allocations from contiguous blocks)
+- Fast allocations (O(1) pointer increment vs O(log n) heap allocation)
+- Cache-friendly (sequential allocations improve cache locality)
+- Accurate memory tracking (atomic counter for concurrent reads)
+- Reduced allocation overhead (no free list traversal)
 
 **Example:**
 ```cpp
-std::string_view key = "mykey";
-auto it = data_.find(key);  // No allocation!
+Arena arena;
+char* key = arena.Allocate(key_size);  // O(1) allocation
+// Memory freed when arena destroyed
 ```
 
-### 4. Range Pruning
+### 4. Lock-Free Skip List for MemTable Storage
+
+**Implementation:**
+- Custom `SkipList` class replaces std::map in MemTable
+- Multiple sorted linked lists at different "levels"
+- Probabilistic height (1/4 chance per level, average ~1.33)
+- Atomic pointer operations for thread-safe reads
+- All nodes allocated from arena
+
+**Benefits:**
+- Lock-free reads (better concurrent read performance)
+- O(log n) average-case operations (insert, lookup)
+- Better cache locality than balanced trees
+- Reduced memory overhead (variable-height nodes)
+- Arena-allocated (zero fragmentation)
+
+**Skip List Structure:**
+- Higher levels skip over more nodes
+- Search starts at highest level, drops down when key passed
+- Average height: O(log n) with good balance
+
+### 5. Range Pruning
 
 **Implementation:**
 - Each memtable tracks `min_key` and `max_key`
@@ -255,7 +288,7 @@ auto it = data_.find(key);  // No allocation!
 - Reduces unnecessary comparisons
 - Particularly effective for range scans
 
-### 5. Bloom Filters
+### 6. Bloom Filters
 
 **Implementation:**
 - 10 bits per key, 7 hash functions
@@ -272,7 +305,7 @@ auto it = data_.find(key);  // No allocation!
 - Set corresponding bits in bloom filter
 - On lookup, check all 7 bits (if any is 0, key definitely not present)
 
-### 6. Sparse Block Indexing
+### 7. Sparse Block Indexing
 
 **Implementation:**
 - One index entry per data block (maps min_key → block offset)
@@ -284,7 +317,7 @@ auto it = data_.find(key);  // No allocation!
 - O(log(blocks)) instead of O(entries)
 - Small index size (typically < 1% of file size)
 
-### 7. Restart Points for Block Search
+### 8. Restart Points for Block Search
 
 **Implementation:**
 - Every 16 entries, store a restart point (offset to full key)
@@ -301,7 +334,7 @@ auto it = data_.find(key);  // No allocation!
 2. Linear scan from restart point (at most 16 entries)
 3. Early termination when key passed (entries are sorted)
 
-### 8. Little-Endian Encoding
+### 9. Little-Endian Encoding
 
 **Implementation:**
 - All multi-byte integers stored in little-endian format
@@ -313,7 +346,7 @@ auto it = data_.find(key);  // No allocation!
 - No runtime byte-order detection needed
 - Consistent file format across platforms
 
-### 9. Atomic Operations for Immutable Chain
+### 10. Atomic Operations for Immutable Chain
 
 **Implementation:**
 - Immutable memtables stored in lock-free linked list
@@ -325,7 +358,7 @@ auto it = data_.find(key);  // No allocation!
 - No blocking during memtable freezing
 - Simple implementation with standard atomics
 
-### 10. Copy-on-Write Layout Updates
+### 11. Copy-on-Write Layout Updates
 
 **Implementation:**
 - Writers create new Layout (copy of old)
@@ -394,7 +427,7 @@ Read-Copy-Update enables:
 
 **Bottlenecks:**
 - Single writer mutex limits write throughput (see deficits)
-- WAL sync can cause latency spikes (not currently synced on every write)
+- WAL sync can cause latency spikes when enabled (configurable via constructor)
 
 ### Read Performance
 
@@ -429,28 +462,36 @@ Read-Copy-Update enables:
 
 ### Concurrency
 
-- **Reads:** Fully concurrent (lock-free)
-- **Writes:** Serialized (single writer mutex)
+- **Reads:** Fully concurrent (lock-free, RCU)
+- **Writes:** Thread-safe but serialized (mutex-protected)
 - **Background:** Runs in separate thread
 
 **Scalability:**
-- Reads scale linearly with number of threads
-- Writes limited by single writer (see deficits)
+- Reads scale linearly with number of threads (lock-free)
+- Writes: Multiple threads supported, but serialized via mutex (see deficits)
 
 ## Known Deficits
 
 This section documents known limitations and areas where the implementation could be improved. These are acknowledged trade-offs made for simplicity and clarity.
 
-### 1. Single Writer Mutex
+### 1. Serialized Writes via Mutex
 
-**Issue:** All write operations are serialized through a single mutex.
+**Status:** Multiple write threads are supported, but writes are serialized through a mutex.
 
-**Impact:** Limits write throughput, especially for multi-threaded workloads.
+**Implementation:** 
+- Multiple threads can call `put()` and `remove()` concurrently
+- All write operations are serialized via `writer_mutex_` for thread safety
+- Writes are thread-safe but not parallel (mutex serialization)
 
-**Why:** Simplifies implementation and ensures correctness. Multi-writer support would require:
-- Partitioning keys across multiple memtables
-- More complex coordination
-- Potential write amplification
+**Impact:** Write throughput is limited by mutex contention in high-concurrency scenarios.
+
+**Why:** Design choice for simplicity and correctness. Serialized writes ensure:
+- Consistent ordering of writes
+- Simpler WAL management
+- Easier correctness reasoning
+- Thread-safe API without requiring external synchronization
+
+**Note:** The implementation supports concurrent write calls (as demonstrated in main.cpp stress test), but the mutex ensures only one write executes at a time. True parallel writes would require partitioning keys across multiple memtables and more complex coordination.
 
 ### 2. ImmNode Memory Leak
 
@@ -506,13 +547,17 @@ This section documents known limitations and areas where the implementation coul
 
 **Better Approach:** Checksums, more detailed logging, repair utilities.
 
-### 8. WAL Not Synced on Every Write
+### 8. WAL Sync Configuration
 
-**Issue:** WAL is buffered and only synced on shutdown or explicit sync.
+**Status:** WAL sync is now configurable via constructor parameter.
 
-**Impact:** Risk of data loss on crash (though small window).
+**Implementation:** 
+- Default: `sync_writes = false` (buffered writes, synced on shutdown)
+- Option: `sync_writes = true` (synced on every write for durability)
 
-**Why:** Reduces write latency. Can be configured to sync on every write if needed.
+**Trade-off:** 
+- Async writes: Lower latency, small risk of data loss on crash
+- Sync writes: Higher latency, guaranteed durability
 
 ### 9. No Column Families
 
@@ -535,7 +580,8 @@ This section documents known limitations and areas where the implementation coul
 ### Constructor
 
 ```cpp
-ZenithDB db("data");  // Creates database in "data" directory
+ZenithDB db("data");                    // Creates database with async WAL writes (default)
+ZenithDB db("data", true);              // Creates database with sync WAL writes (durable)
 ```
 
 ### Write Operations

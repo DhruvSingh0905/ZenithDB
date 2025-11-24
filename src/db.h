@@ -16,22 +16,6 @@
 #include <thread>
 #include <vector>
 
-/**
- * ZenithDB - High-performance embedded key-value database engine.
- * 
- * Implements an LSM-tree (Log-Structured Merge Tree) architecture optimized
- * for write-heavy workloads with excellent read performance through:
- * - Lock-free reads using RCU (Read-Copy-Update) semantics
- * - Memory-mapped SSTable files for zero-copy reads
- * - Bloom filters for fast negative lookups
- * - Sparse block indexing with restart points for efficient binary search
- * - Range pruning to skip irrelevant data structures
- * 
- * Thread Safety:
- * - Reads: Fully concurrent and lock-free (RCU)
- * - Writes: Serialized via writer_mutex_ (single writer)
- * - Background operations: Run in separate thread with writer_mutex_
- */
 class ZenithDB {
 public:
     /**
@@ -44,8 +28,9 @@ public:
      * - Starts background worker thread for flushing and compaction
      * 
      * @param dir Directory path for database files (default: "data")
+     * @param sync_writes If true, syncs WAL to disk on every write for durability (default: false)
      */
-    explicit ZenithDB(const std::string& dir = "data");
+    explicit ZenithDB(const std::string& dir = "data", bool sync_writes = false);
     
     /**
      * Destructor.
@@ -61,7 +46,8 @@ public:
      * 1. Acquires writer_mutex_ (serializes writes)
      * 2. Writes to active memtable (O(log n) insertion)
      * 3. Appends to WAL for durability
-     * 4. If memtable exceeds threshold, freezes it and adds to immutable chain
+     * 4. Optionally syncs WAL if sync_writes_ is enabled
+     * 5. If memtable exceeds threshold, freezes it and adds to immutable chain
      * 
      * @param key The key to insert/update
      * @param value The value to associate with the key
@@ -122,11 +108,11 @@ private:
      */
     struct Layout {
         struct FileEntry {
-            std::shared_ptr<SSTable> sst;      // Memory-mapped SSTable file
-            std::string min_key;                // Minimum key in this file (for range pruning)
-            std::string max_key;                // Maximum key in this file (for range pruning)
+            std::shared_ptr<SSTable> sst;
+            std::string min_key;
+            std::string max_key;
         };
-        std::vector<std::vector<FileEntry>> levels;  // One vector per level
+        std::vector<std::vector<FileEntry>> levels;
     };
 
     /**
@@ -138,17 +124,14 @@ private:
      * - Where to write the output
      */
     struct CompactionTask {
-        int level;                                              // Level being compacted
-        std::vector<std::string> input_filenames;              // Filenames being merged
-        std::vector<std::shared_ptr<SSTable>> input_ssts;      // SSTable objects (for reading)
-        std::string output_filename;                            // Output filename
-        std::shared_ptr<SSTable> output_sst;                    // Output SSTable (after creation)
+        int level;
+        std::vector<std::string> input_filenames;
+        std::vector<std::shared_ptr<SSTable>> input_ssts;
+        std::string output_filename;
+        std::shared_ptr<SSTable> output_sst;
     };
 
-    // RCU layout snapshot - atomically swapped for lock-free reads
     std::shared_ptr<Layout> layout_;
-    
-    // Active memtable - current write target (atomically swapped)
     std::shared_ptr<MemTable> active_mem_;
 
     /**
@@ -159,24 +142,23 @@ private:
      * until garbage collected (currently not reclaimed - known deficit).
      */
     struct ImmNode {
-        std::shared_ptr<MemTable> mt;  // The immutable memtable
-        ImmNode* next;                  // Next node in chain
-        bool flushed;                   // Whether this has been flushed to disk
+        std::shared_ptr<MemTable> mt;
+        ImmNode* next;
+        bool flushed; 
     };
 
-    // Lock-free head of immutable memtable chain (RCU-style)
     std::atomic<ImmNode*> immut_head_{nullptr};
 
-    std::filesystem::path data_dir_;    // Database directory
-    Manifest manifest_;                  // Tracks SSTable files per level
-    std::unique_ptr<WAL> wal_;          // Write-ahead log for durability
-    std::vector<Level> levels_meta_;    // Metadata about each level (file lists)
+    std::filesystem::path data_dir_;
+    Manifest manifest_;
+    std::unique_ptr<WAL> wal_;
+    std::vector<Level> levels_meta_;
 
-    std::thread worker_;                 // Background worker thread
-    std::atomic<bool> stop_{false};     // Shutdown flag
-    mutable std::mutex writer_mutex_;   // Serializes writes and background operations
+    std::thread worker_;
+    std::atomic<bool> stop_{false};
+    mutable std::mutex writer_mutex_;
+    bool sync_writes_;
 
-    // Memtable size threshold (50KB) - when exceeded, memtable is frozen
     static const std::size_t MEMTABLE_LIMIT = 50 * 1024;
 
     /**

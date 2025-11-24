@@ -1,36 +1,43 @@
 #pragma once
 
-#include <map>
-#include <optional>
+#include "skiplist.h"
+#include "arena.h"
+#include <vector>
 #include <string>
 #include <string_view>
-#include <vector>
-#include <cstddef>
+#include <optional>
 
 /**
- * MemTable - In-memory sorted key-value store.
+ * MemTable - In-memory sorted key-value store using lock-free skip list.
  * 
- * Uses std::map with transparent comparator (std::less<>) to enable
- * zero-allocation lookups with string_view. This is a critical optimization
- * that avoids string allocations during read operations.
+ * CRITICAL LOW-LEVEL OPTIMIZATION: Uses a lock-free skip list with arena
+ * allocator instead of std::map. This provides:
+ * - Lock-free reads: Better concurrent read performance
+ * - Zero memory fragmentation: Arena allocator eliminates heap fragmentation
+ * - Cache-friendly: Sequential allocations improve cache locality
+ * - Reduced allocation overhead: O(1) arena allocations vs O(log n) heap allocations
  * 
- * Features:
- * - O(log n) insertions and lookups
- * - Range tracking (min_key, max_key) for efficient pruning
- * - Approximate size tracking for flush decisions
- * - Tombstone support (empty value = deleted)
+ * The skip list provides O(log n) average-case operations (insert, lookup)
+ * with better cache behavior than balanced trees. The arena allocator ensures
+ * all memory is allocated from contiguous blocks, eliminating fragmentation.
  * 
  * Thread Safety: Not thread-safe (protected by writer_mutex_ in ZenithDB)
  */
 class MemTable {
 public:
-    MemTable() = default;
+    /**
+     * Constructs an empty memtable.
+     * 
+     * Initializes the skip list with the arena allocator.
+     */
+    MemTable();
+    
+    // No copy/move (arena and skip list are not copyable)
+    MemTable(const MemTable&) = delete;
+    MemTable& operator=(const MemTable&) = delete;
 
     /**
      * Inserts or updates a key-value pair.
-     * 
-     * Uses emplace() to avoid unnecessary string copies when key doesn't exist.
-     * Updates approximate size counter for flush decisions.
      * 
      * @param key The key (string_view avoids allocation)
      * @param value The value (string_view avoids allocation)
@@ -47,9 +54,6 @@ public:
     /**
      * Retrieves a value by key.
      * 
-     * Uses std::map::find() with string_view (no allocation thanks to std::less<>).
-     * This is a critical optimization for read performance.
-     * 
      * @param key The key to look up
      * @return Optional containing the value, or nullopt if not found
      */
@@ -58,7 +62,7 @@ public:
     /**
      * Performs a range scan (inclusive on both ends).
      * 
-     * Uses lower_bound() with string_view for efficient range queries.
+     * Uses skip list iterator for efficient sequential traversal.
      * 
      * @param start Start key (inclusive)
      * @param end End key (inclusive)
@@ -78,10 +82,9 @@ public:
     /**
      * Returns approximate size in bytes (for flush decisions).
      * 
-     * This is approximate because it doesn't account for map overhead,
-     * but it's sufficient for threshold checks.
+     * Uses arena memory usage, which accurately tracks all allocations.
      */
-    std::size_t approximate_size() const { return approx_bytes_; }
+    std::size_t approximate_size() const { return arena_.MemoryUsage(); }
     
     /**
      * Returns whether this memtable has valid range metadata.
@@ -99,16 +102,9 @@ public:
     const std::string& max_key() const { return max_key_; }
 
 private:
-    /**
-     * The underlying sorted map.
-     * 
-     * std::less<> enables transparent comparison, allowing find() and lower_bound()
-     * to work with string_view without allocating temporary strings. This is a
-     * critical low-level optimization that significantly improves read performance.
-     */
-    std::map<std::string, std::string, std::less<>> data_;
+    Arena arena_;        // Arena allocator for all memory (zero fragmentation)
+    SkipList table_;     // Lock-free skip list for sorted key-value storage
 
-    std::size_t approx_bytes_ = 0;  // Approximate size in bytes
     bool has_range_ = false;         // Whether min/max keys are valid
     std::string min_key_;            // Minimum key (for range pruning)
     std::string max_key_;            // Maximum key (for range pruning)
