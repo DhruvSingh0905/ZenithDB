@@ -1,14 +1,13 @@
 #include "memtable.h"
-
 #include <algorithm>
 
 /**
- * Updates the key range metadata when a new key is inserted.
+ * Updates the min/max key range when a new key is inserted.
  * 
- * Maintains the minimum and maximum keys seen so far to enable
- * efficient range pruning during point lookups.
+ * This enables efficient range pruning: readers can skip this memtable
+ * entirely if the lookup key is outside [min_key_, max_key_].
  */
-void MemTable::update_range(const std::string& key) {
+void MemTable::update_range(std::string_view key) {
     if (!has_range_) {
         min_key_   = key;
         max_key_   = key;
@@ -19,69 +18,59 @@ void MemTable::update_range(const std::string& key) {
     }
 }
 
-/**
- * Inserts or updates a key-value pair in the memtable.
- * 
- * Updates size approximation and range metadata.
- */
-void MemTable::put(const std::string& key, const std::string& value) {
-    // Simple approximate byte accounting: key + value
+void MemTable::put(std::string_view key, std::string_view value) {
+    // Update approximate size (used for flush threshold checks)
     approx_bytes_ += key.size() + value.size();
-
-    data_[key] = value;
+    
+    // Emplace constructs string from string_view only if key doesn't exist.
+    // This avoids unnecessary allocations when updating existing keys.
+    auto [it, inserted] = data_.emplace(key, value);
+    if (!inserted) {
+        // Key already exists - update value
+        it->second = value;
+    }
     update_range(key);
 }
 
-/**
- * Deletes a key by inserting a tombstone (empty value).
- * 
- * The tombstone will hide the key and eventually cause it to be
- * removed during compaction.
- */
-void MemTable::remove(const std::string& key) {
-    // Tombstone as empty string; count a bit of size as well
+void MemTable::remove(std::string_view key) {
     approx_bytes_ += key.size() + 1;
-    data_[key] = std::string();  // empty -> tombstone
+    // Insert/Update with empty string (tombstone)
+    auto [it, inserted] = data_.emplace(key, "");
+    if (!inserted) {
+        it->second.clear();
+    }
     update_range(key);
 }
 
-/**
- * Performs a point lookup in the memtable.
- * 
- * Returns the value (which may be empty for tombstones) or nullopt.
- */
-std::optional<std::string> MemTable::get(const std::string& key) const {
+std::optional<std::string> MemTable::get(std::string_view key) const {
+    // CRITICAL OPTIMIZATION: find() with string_view works without allocation
+    // thanks to std::less<> transparent comparator. This is a low-level
+    // optimization that significantly improves read performance by avoiding
+    // temporary string allocations.
     auto it = data_.find(key);
     if (it == data_.end()) {
         return std::nullopt;
     }
-    return it->second;  // may be empty string (tombstone)
+    return it->second;
 }
 
-/**
- * Performs a range scan over keys in the memtable.
- * 
- * Uses std::map's lower_bound for efficient range iteration.
- */
 std::vector<std::pair<std::string, std::string>> MemTable::scan(
-    const std::string& start,
-    const std::string& end) const
+    std::string_view start,
+    std::string_view end) const
 {
     std::vector<std::pair<std::string, std::string>> out;
     if (start > end) return out;
 
+    // CRITICAL OPTIMIZATION: lower_bound() with string_view works without
+    // allocation thanks to std::less<> transparent comparator.
     auto it = data_.lower_bound(start);
-    for (; it != data_.end() && it->first <= end; ++it) {
+    for (; it != data_.end(); ++it) {
+        if (it->first > end) break;  // Stop when we've passed the end key
         out.emplace_back(it->first, it->second);
     }
     return out;
 }
 
-/**
- * Returns all entries in sorted order for flushing to disk.
- * 
- * Since we use std::map, entries are already sorted by key.
- */
 std::vector<std::pair<std::string, std::string>> MemTable::sorted_entries() const {
     std::vector<std::pair<std::string, std::string>> out;
     out.reserve(data_.size());

@@ -3,21 +3,24 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <cstddef>
 
 /**
  * MemTable - In-memory sorted key-value store.
  * 
- * MemTables are the write buffer for ZenithDB. They store key-value pairs
- * in a sorted map structure. When a MemTable becomes immutable (frozen),
- * it can be safely flushed to disk as an SSTable while reads continue.
+ * Uses std::map with transparent comparator (std::less<>) to enable
+ * zero-allocation lookups with string_view. This is a critical optimization
+ * that avoids string allocations during read operations.
  * 
  * Features:
- * - Fast in-memory writes (O(log n) insertion)
- * - Range tracking for efficient pruning during reads
+ * - O(log n) insertions and lookups
+ * - Range tracking (min_key, max_key) for efficient pruning
  * - Approximate size tracking for flush decisions
  * - Tombstone support (empty value = deleted)
+ * 
+ * Thread Safety: Not thread-safe (protected by writer_mutex_ in ZenithDB)
  */
 class MemTable {
 public:
@@ -26,103 +29,94 @@ public:
     /**
      * Inserts or updates a key-value pair.
      * 
-     * Updates the approximate size and key range metadata.
+     * Uses emplace() to avoid unnecessary string copies when key doesn't exist.
+     * Updates approximate size counter for flush decisions.
      * 
-     * @param key The key to insert/update
-     * @param value The value (non-empty = live, empty = tombstone)
+     * @param key The key (string_view avoids allocation)
+     * @param value The value (string_view avoids allocation)
      */
-    void put(const std::string& key, const std::string& value);
-
+    void put(std::string_view key, std::string_view value);
+    
     /**
-     * Marks a key as deleted by inserting a tombstone.
-     * 
-     * A tombstone is represented as an empty string value.
+     * Deletes a key by inserting a tombstone (empty value).
      * 
      * @param key The key to delete
      */
-    void remove(const std::string& key);
+    void remove(std::string_view key);
 
     /**
-     * Performs a point lookup for a key.
+     * Retrieves a value by key.
+     * 
+     * Uses std::map::find() with string_view (no allocation thanks to std::less<>).
+     * This is a critical optimization for read performance.
      * 
      * @param key The key to look up
-     * @return Optional containing the value (may be empty for tombstone), or nullopt if not found
+     * @return Optional containing the value, or nullopt if not found
      */
-    std::optional<std::string> get(const std::string& key) const;
+    std::optional<std::string> get(std::string_view key) const;
 
     /**
-     * Performs an inclusive range scan.
+     * Performs a range scan (inclusive on both ends).
      * 
-     * Returns all key-value pairs where start <= key <= end.
+     * Uses lower_bound() with string_view for efficient range queries.
      * 
-     * @param start The inclusive start key
-     * @param end The inclusive end key
-     * @return Vector of (key, value) pairs in sorted order
+     * @param start Start key (inclusive)
+     * @param end End key (inclusive)
+     * @return Vector of key-value pairs in sorted order
      */
     std::vector<std::pair<std::string, std::string>> scan(
-        const std::string& start,
-        const std::string& end) const;
+        std::string_view start,
+        std::string_view end) const;
 
     /**
-     * Returns all entries sorted by key.
+     * Returns all entries in sorted order (for flushing to SSTable).
      * 
-     * Used when flushing the memtable to disk. The entries are
-     * already sorted since we use a std::map internally.
-     * 
-     * @return Vector of all (key, value) pairs in sorted order
+     * @return Vector of all key-value pairs, sorted by key
      */
     std::vector<std::pair<std::string, std::string>> sorted_entries() const;
 
     /**
-     * Returns the approximate size in bytes.
+     * Returns approximate size in bytes (for flush decisions).
      * 
-     * This is a rough estimate used for flush threshold decisions.
-     * It counts key + value sizes but doesn't account for map overhead.
-     * 
-     * @return Approximate size in bytes
+     * This is approximate because it doesn't account for map overhead,
+     * but it's sufficient for threshold checks.
      */
     std::size_t approximate_size() const { return approx_bytes_; }
-
+    
     /**
      * Returns whether this memtable has valid range metadata.
-     * 
-     * @return True if min_key and max_key are valid
      */
     bool has_range() const { return has_range_; }
     
     /**
-     * Returns the minimum key in this memtable.
-     * 
-     * @return The smallest key, or empty string if no range
+     * Returns the minimum key in this memtable (for range pruning).
      */
     const std::string& min_key() const { return min_key_; }
     
     /**
-     * Returns the maximum key in this memtable.
-     * 
-     * @return The largest key, or empty string if no range
+     * Returns the maximum key in this memtable (for range pruning).
      */
     const std::string& max_key() const { return max_key_; }
 
 private:
-    // key -> value (empty string == tombstone)
-    std::map<std::string, std::string> data_;
+    /**
+     * The underlying sorted map.
+     * 
+     * std::less<> enables transparent comparison, allowing find() and lower_bound()
+     * to work with string_view without allocating temporary strings. This is a
+     * critical low-level optimization that significantly improves read performance.
+     */
+    std::map<std::string, std::string, std::less<>> data_;
 
-    // Approximate size in bytes
-    std::size_t approx_bytes_ = 0;
-
-    // Range tracking
-    bool has_range_ = false;
-    std::string min_key_;
-    std::string max_key_;
+    std::size_t approx_bytes_ = 0;  // Approximate size in bytes
+    bool has_range_ = false;         // Whether min/max keys are valid
+    std::string min_key_;            // Minimum key (for range pruning)
+    std::string max_key_;            // Maximum key (for range pruning)
 
     /**
-     * Updates the min/max key range metadata.
+     * Updates min_key and max_key when a new key is inserted.
      * 
-     * Called whenever a key is inserted to maintain range bounds
-     * for efficient pruning during reads.
-     * 
-     * @param key The key that was just inserted
+     * @param key The newly inserted key
      */
-    void update_range(const std::string& key);
+    void update_range(std::string_view key);
 };

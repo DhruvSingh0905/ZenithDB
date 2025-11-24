@@ -12,210 +12,242 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
 /**
- * ZenithDB - A high-performance LSM-tree based key-value database.
+ * ZenithDB - High-performance embedded key-value database engine.
  * 
- * This class implements a Log-Structured Merge Tree (LSM-tree) storage engine
- * similar to LevelDB/RocksDB. It provides ACID-like guarantees with:
- * - Write-ahead logging (WAL) for durability
- * - Memtable-based in-memory writes for low latency
- * - Multi-level SSTable storage on disk
- * - Background compaction for space efficiency
- * - RCU (Read-Copy-Update) for lock-free reads
+ * Implements an LSM-tree (Log-Structured Merge Tree) architecture optimized
+ * for write-heavy workloads with excellent read performance through:
+ * - Lock-free reads using RCU (Read-Copy-Update) semantics
+ * - Memory-mapped SSTable files for zero-copy reads
  * - Bloom filters for fast negative lookups
+ * - Sparse block indexing with restart points for efficient binary search
+ * - Range pruning to skip irrelevant data structures
+ * 
+ * Thread Safety:
+ * - Reads: Fully concurrent and lock-free (RCU)
+ * - Writes: Serialized via writer_mutex_ (single writer)
+ * - Background operations: Run in separate thread with writer_mutex_
  */
 class ZenithDB {
 public:
     /**
-     * Constructs a new ZenithDB instance.
+     * Constructs a ZenithDB instance.
      * 
-     * Initializes the database by:
-     * - Creating the data directory if it doesn't exist
-     * - Replaying the WAL to recover the active memtable
-     * - Loading the manifest to reconstruct the SSTable layout
-     * - Opening all existing SSTables and building the RCU layout snapshot
-     * - Starting the background worker thread for flushing and compaction
+     * Opens or creates a database in the specified directory. On startup:
+     * - Replays WAL to reconstruct active memtable
+     * - Loads manifest to reconstruct level structure
+     * - Opens all existing SSTable files and builds layout snapshot
+     * - Starts background worker thread for flushing and compaction
      * 
-     * @param dir The directory path where database files will be stored (default: "data")
+     * @param dir Directory path for database files (default: "data")
      */
     explicit ZenithDB(const std::string& dir = "data");
     
     /**
-     * Destructor that gracefully shuts down the database.
+     * Destructor.
      * 
-     * Stops the background worker thread, syncs the WAL to disk,
-     * and cleans up resources. Note: ImmNode objects are intentionally
-     * leaked for simplicity (production would use epoch-based reclamation).
+     * Stops background worker, syncs WAL to disk, and cleans up resources.
      */
     ~ZenithDB();
 
     /**
-     * Inserts or updates a key-value pair in the database.
+     * Inserts or updates a key-value pair.
      * 
-     * The write operation:
-     * - Appends to the active memtable (in-memory)
-     * - Writes to the WAL for durability
-     * - Automatically freezes the memtable when it exceeds 2x MEMTABLE_LIMIT
-     * - Frozen memtables are added to the immutable chain for background flushing
+     * Write path:
+     * 1. Acquires writer_mutex_ (serializes writes)
+     * 2. Writes to active memtable (O(log n) insertion)
+     * 3. Appends to WAL for durability
+     * 4. If memtable exceeds threshold, freezes it and adds to immutable chain
      * 
-     * @param key The key to insert/update (must not be empty)
+     * @param key The key to insert/update
      * @param value The value to associate with the key
      */
     void put(const std::string& key, const std::string& value);
     
     /**
-     * Retrieves the value associated with a key.
+     * Retrieves a value by key.
      * 
-     * Performs a point lookup by searching in order:
-     * 1. Active memtable (with range pruning)
-     * 2. Immutable memtable chain (lock-free, with range pruning)
-     * 3. On-disk SSTables via RCU snapshot (with bloom filter and range pruning)
+     * Read path (lock-free, uses RCU):
+     * 1. Checks active memtable (with range pruning)
+     * 2. Checks immutable memtable chain (lock-free traversal)
+     * 3. Checks SSTables from Level 0 to deeper levels:
+     *    - Range pruning to skip irrelevant files
+     *    - Bloom filter to quickly reject files
+     *    - Sparse index binary search to find block
+     *    - Block scan with restart points for efficient search
      * 
-     * Returns nullopt if the key is not found or has been deleted (tombstone).
-     * This operation is lock-free for readers using RCU semantics.
+     * Returns nullopt if key not found or deleted (tombstone).
      * 
-     * @param key The key to look up
-     * @return Optional containing the value if found, nullopt otherwise
+     * @param key The key to look up (string_view avoids allocation)
+     * @return Optional containing the value, or nullopt if not found
      */
-    std::optional<std::string> get(const std::string& key) const;
+    std::optional<std::string> get(std::string_view key) const;
     
     /**
-     * Deletes a key from the database.
+     * Deletes a key by inserting a tombstone (empty value).
      * 
-     * Deletion is implemented as a tombstone (empty value) in the memtable.
-     * The tombstone will be propagated through compaction and eventually
-     * remove the key from all SSTables. Until compaction completes, the
-     * tombstone prevents the key from being visible.
+     * The tombstone will be removed during compaction when it reaches
+     * a level where no older versions exist.
      * 
      * @param key The key to delete
      */
     void remove(const std::string& key);
 
     /**
-     * Performs a range scan over keys in the database.
+     * Performs a range scan (inclusive on both ends).
      * 
-     * Returns all key-value pairs where start <= key <= end (inclusive).
-     * The scan:
-     * - Searches active and immutable memtables
-     * - Searches all relevant SSTables using range pruning
-     * - Deduplicates results (latest value wins)
-     * - Filters out tombstones
+     * Scans all memtables and SSTables, merges results, removes duplicates
+     * (keeping latest), and filters out tombstones.
      * 
-     * @param start The inclusive start key (default: empty string = beginning)
-     * @param end The inclusive end key (default: "\xFF\xFF" = end)
-     * @return Vector of (key, value) pairs in sorted order
+     * @param start Start key (inclusive), default: "" (beginning)
+     * @param end End key (inclusive), default: "\xFF\xFF" (end)
+     * @return Vector of key-value pairs in sorted order
      */
     std::vector<std::pair<std::string, std::string>> scan(
-        const std::string& start = "",
-        const std::string& end   = "\xFF\xFF") const;
+        std::string_view start = "",
+        std::string_view end   = "\xFF\xFF") const;
 
 private:
-    // --------- On-disk layout snapshot (RCU) ---------
+    /**
+     * Layout - RCU snapshot of the on-disk SSTable structure.
+     * 
+     * This structure is atomically swapped to enable lock-free reads.
+     * Readers take a snapshot via atomic_load_ptr, use it, then release.
+     * Writers create a new Layout, modify it, then publish via atomic_store_ptr.
+     * Old snapshots remain valid until all readers release them.
+     */
     struct Layout {
         struct FileEntry {
-            std::shared_ptr<SSTable> sst;
-            std::string min_key;
-            std::string max_key;
+            std::shared_ptr<SSTable> sst;      // Memory-mapped SSTable file
+            std::string min_key;                // Minimum key in this file (for range pruning)
+            std::string max_key;                // Maximum key in this file (for range pruning)
         };
-
-        // levels[level_index][file_index]
-        std::vector<std::vector<FileEntry>> levels;
+        std::vector<std::vector<FileEntry>> levels;  // One vector per level
     };
 
-    // Shared pointer used with std::atomic_load/store (via free functions).
-    std::shared_ptr<Layout> layout_;
+    /**
+     * CompactionTask - Represents a compaction job.
+     * 
+     * Contains all information needed to compact a level:
+     * - Which level to compact
+     * - Which files to merge (filenames and SSTable objects)
+     * - Where to write the output
+     */
+    struct CompactionTask {
+        int level;                                              // Level being compacted
+        std::vector<std::string> input_filenames;              // Filenames being merged
+        std::vector<std::shared_ptr<SSTable>> input_ssts;      // SSTable objects (for reading)
+        std::string output_filename;                            // Output filename
+        std::shared_ptr<SSTable> output_sst;                    // Output SSTable (after creation)
+    };
 
-    // --------- Memtables ---------
-    // Active mutable memtable
+    // RCU layout snapshot - atomically swapped for lock-free reads
+    std::shared_ptr<Layout> layout_;
+    
+    // Active memtable - current write target (atomically swapped)
     std::shared_ptr<MemTable> active_mem_;
 
-    // Immutable memtable chain; readers walk it lock-free.
+    /**
+     * ImmNode - Node in lock-free linked list of immutable memtables.
+     * 
+     * When a memtable is frozen, it's added to this chain. The background
+     * worker flushes them to disk. Once flushed, they remain in the chain
+     * until garbage collected (currently not reclaimed - known deficit).
+     */
     struct ImmNode {
-        std::shared_ptr<MemTable> mt;
-        ImmNode* next;
-        bool flushed;  // set true by background thread once flushed to disk
+        std::shared_ptr<MemTable> mt;  // The immutable memtable
+        ImmNode* next;                  // Next node in chain
+        bool flushed;                   // Whether this has been flushed to disk
     };
 
+    // Lock-free head of immutable memtable chain (RCU-style)
     std::atomic<ImmNode*> immut_head_{nullptr};
 
-    // --------- Storage + background state ---------
-    std::filesystem::path data_dir_;
-    Manifest manifest_;
-    std::unique_ptr<WAL> wal_;
-    std::vector<Level> levels_meta_;
+    std::filesystem::path data_dir_;    // Database directory
+    Manifest manifest_;                  // Tracks SSTable files per level
+    std::unique_ptr<WAL> wal_;          // Write-ahead log for durability
+    std::vector<Level> levels_meta_;    // Metadata about each level (file lists)
 
-    std::thread worker_;
-    std::atomic<bool> stop_{false};
+    std::thread worker_;                 // Background worker thread
+    std::atomic<bool> stop_{false};     // Shutdown flag
+    mutable std::mutex writer_mutex_;   // Serializes writes and background operations
 
-    // Single writer-side mutex:
-    // - put/remove
-    // - flushing memtables
-    // - compaction
-    // - updating manifest_ and levels_meta_
-    mutable std::mutex writer_mutex_;
+    // Memtable size threshold (50KB) - when exceeded, memtable is frozen
+    static const std::size_t MEMTABLE_LIMIT = 50 * 1024;
 
-    static const std::size_t MEMTABLE_LIMIT = 50 * 1024;  // ~50KB
-
-    // --------- Internal helpers ---------
-    
     /**
-     * Background worker thread that handles flushing and compaction.
+     * Background worker thread main loop.
      * 
-     * This thread runs continuously until stop_ is set, performing:
-     * 1. Flushing immutable memtables to Level 0 SSTables
-     * 2. Compacting levels when they exceed their thresholds
-     * 3. Updating the manifest with file changes
-     * 4. Publishing new RCU layout snapshots for readers
+     * Continuously:
+     * 1. Flushes immutable memtables to Level 0 SSTables
+     * 2. Plans and executes compactions when thresholds are met
+     * 3. Updates layout snapshots atomically
      * 
-     * Runs every 100ms to balance responsiveness and CPU usage.
+     * Runs every 100ms or when work is available.
      */
     void background_worker();
     
     /**
-     * Compacts all SSTables in a given level into the next level.
+     * Plans a compaction task if thresholds are met.
      * 
-     * Compaction merges multiple SSTables, removes duplicates (keeping latest),
-     * drops tombstones for deleted keys, and writes a new merged SSTable
-     * to the next level. This reduces read amplification and reclaims space.
+     * Checks each level for compaction triggers:
+     * - Level 0: ≥ 3 files
+     * - Level 1+: ≥ 4 files
      * 
-     * @param level The level to compact (must be < levels_meta_.size() - 1)
-     * @param layout The layout snapshot to update with new SSTable entries
+     * Returns a CompactionTask if compaction is needed, nullopt otherwise.
+     * 
+     * @param layout Current layout snapshot
+     * @return CompactionTask if compaction needed, nullopt otherwise
      */
-    void compact_level(int level, Layout& layout);
+    std::optional<CompactionTask> plan_compaction(const Layout& layout);
+    
+    /**
+     * Executes a compaction task (I/O heavy, runs without lock).
+     * 
+     * Merges all input SSTables, removes duplicates (keeps latest),
+     * drops tombstones, and writes merged result to new SSTable.
+     * 
+     * @param task The compaction task to execute
+     */
+    void execute_compaction(CompactionTask& task);
+    
+    /**
+     * Applies compaction results to layout and metadata (runs with lock).
+     * 
+     * Updates manifest, levels_meta_, and creates new layout snapshot
+     * with old files removed and new file added.
+     * 
+     * @param task The completed compaction task
+     * @param new_layout The new layout to update
+     */
+    void apply_compaction(const CompactionTask& task, Layout& new_layout);
     
     /**
      * Generates a unique filename for a new SSTable.
      * 
      * Format: "L{level}_{timestamp}_{counter}.sst"
-     * The counter ensures uniqueness even if multiple files are created
-     * in the same second.
      * 
-     * @param level The level number for the SSTable
-     * @return A unique filename string
+     * @param level The level number
+     * @return Unique filename
      */
     std::string new_filename(int level);
 
     /**
-     * Sorts the FileEntries in a specific level by min_key.
-     * 
-     * This enables binary search and range pruning during reads.
-     * Should be called after adding new SSTables to a level.
+     * Sorts a level's FileEntry vector by min_key for efficient binary search.
      * 
      * @param layout The layout to modify
-     * @param level The level index to sort
+     * @param level The level to sort
      */
     static void sort_level_by_min_key(Layout& layout, std::size_t level);
     
     /**
-     * Sorts all levels in the layout by min_key.
+     * Sorts all levels by min_key.
      * 
-     * Convenience function to ensure all levels are properly ordered
-     * after bulk operations like compaction or recovery.
-     * 
-     * @param layout The layout to sort
+     * @param layout The layout to modify
      */
     static void sort_all_levels_by_min_key(Layout& layout);
 };

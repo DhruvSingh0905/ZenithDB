@@ -50,6 +50,11 @@
         "tuple": "cpp",
         "typeinfo": "cpp",
         "variant": "cpp",
-        "algorithm": "cpp"
+        "algorithm": "cpp",
+        "__bit_reference": "cpp",
+        "charconv": "cpp",
+        "execution": "cpp",
+        "iostream": "cpp",
+        "sstream": "cpp"
     }
 }
