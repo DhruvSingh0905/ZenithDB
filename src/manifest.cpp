@@ -1,71 +1,81 @@
 // src/manifest.cpp
 #include "manifest.h"
-#include <fstream>
 #include <sstream>
 
-/**
- * Constructs a Manifest that uses "MANIFEST" file in the given directory.
- */
-Manifest::Manifest(const std::filesystem::path& dir) : path_(dir / "MANIFEST") {}
+Manifest::Manifest(Env* env, const std::filesystem::path& dir) 
+    : env_(env), path_(dir / "MANIFEST") {
+    // Open in append mode immediately
+    manifest_file_ = env_->NewAppendableFile(path_);
+}
 
-/**
- * Appends an "ADD" record to the manifest log.
- */
 void Manifest::add_sstable(int level, const std::string& filename) {
-    std::ofstream out(path_, std::ios::app);
-    if (out) {
-        out << "ADD " << level << " " << filename << '\n';
+    if (manifest_file_) {
+        std::string record = "ADD " + std::to_string(level) + " " + filename + "\n";
+        manifest_file_->Append(record);
+        manifest_file_->Flush(); // Manifest should generally flush often
     }
 }
 
-/**
- * Records file replacements by writing DEL records for old files
- * and ADD records for new files.
- */
 void Manifest::replace(int level,
                       const std::vector<std::string>& old_files,
                       const std::vector<std::string>& new_files) {
-    std::ofstream out(path_, std::ios::app);
-    if (!out) return;
+    if (!manifest_file_) return;
 
     for (const auto& f : old_files) {
-        out << "DEL " << level << " " << f << '\n';
+        std::string rec = "DEL " + std::to_string(level) + " " + f + "\n";
+        manifest_file_->Append(rec);
     }
     for (const auto& f : new_files) {
-        out << "ADD " << level << " " << f << '\n';
+        std::string rec = "ADD " + std::to_string(level) + " " + f + "\n";
+        manifest_file_->Append(rec);
     }
+    manifest_file_->Flush();
 }
 
-/**
- * Loads the manifest and reconstructs the level structure.
- * 
- * Reads all ADD records and builds a vector of Level structures.
- * DEL records are ignored during recovery (we only care about current state).
- */
 std::vector<Level> Manifest::load() {
     std::vector<Level> levels(7);
 
-    if (!std::filesystem::exists(path_)) {
+    if (!env_->FileExists(path_)) {
         return levels;
     }
 
-    std::ifstream in(path_);
-    std::string line;
+    auto reader = env_->NewSequentialFile(path_);
+    char scratch[4096];
+    std::string buffer;
+    std::string leftover;
 
-    while (std::getline(in, line)) {
-        std::istringstream iss(line);
-        std::string op;
-        int lvl;
-        std::string file;
-
-        if (!(iss >> op >> lvl)) continue;
-
-        if (op == "ADD" && iss >> file) {
-            if (lvl >= 0 && lvl < levels.size()) {
-                levels[lvl].files.push_back(file);
+    while (true) {
+        reader->Read(sizeof(scratch), &buffer, scratch);
+        if (buffer.empty()) break; 
+        
+        leftover.append(buffer);
+        size_t pos = 0;
+        
+        while (true) {
+            size_t nl = leftover.find('\n', pos);
+            if (nl == std::string::npos) {
+                leftover.erase(0, pos);
+                break;
             }
+            std::string line = leftover.substr(pos, nl - pos);
+            pos = nl + 1;
+            
+            if (line.empty()) continue;
+
+            std::istringstream iss(line);
+            std::string op;
+            int lvl;
+            std::string file;
+
+            if (!(iss >> op >> lvl)) continue;
+
+            if (op == "ADD" && iss >> file) {
+                if (lvl >= 0 && lvl < (int)levels.size()) {
+                    levels[lvl].files.push_back(file);
+                }
+            }
+            // Ignore DEL during recovery (assuming simplistic replay)
         }
-        // Ignore DEL during recovery
     }
     return levels;
 }

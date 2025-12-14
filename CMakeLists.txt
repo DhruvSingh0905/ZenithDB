@@ -21,6 +21,7 @@ add_library(zenithdb_lib STATIC
     src/sstable.cpp
     src/manifest.cpp
     src/compaction.cpp
+    src/fs_posix.cpp  # <--- CRITICAL FIX: Added this file
 )
 
 target_include_directories(zenithdb_lib PUBLIC src)
@@ -35,7 +36,7 @@ target_link_libraries(zenithdb PRIVATE zenithdb_lib)
 # Tests
 # ------------------------------
 add_executable(tests
-    tests/skiplist_test.cpp
+    tests/test_vfs.cpp
 
 
 )

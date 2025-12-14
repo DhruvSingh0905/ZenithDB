@@ -3,76 +3,49 @@
 #include "memtable.h"
 #include "utils.h"
 
-#include <fcntl.h>
-#include <unistd.h>
-#include <iostream>
-#include <cstring>
-#include <cerrno>
+#include <stdexcept>
+#include <vector>
 
-/**
- * Opens or creates the WAL file in append mode.
- */
-WAL::WAL(const std::filesystem::path& dir) {
-    std::filesystem::create_directories(dir);
+WAL::WAL(Env* env, const std::filesystem::path& dir) 
+    : env_(env) {
+    env_->CreateDir(dir);
     path_ = dir / "wal.log";
-
-    fd_ = open(path_.c_str(), O_CREAT | O_RDWR | O_APPEND, 0644);
-    if (fd_ == -1) {
-        throw std::runtime_error("Cannot open WAL: " + path_.string() + " " + std::strerror(errno));
-    }
+    log_file_ = env_->NewAppendableFile(path_);
 }
 
-/**
- * Syncs the WAL to disk and closes the file.
- */
 WAL::~WAL() {
-    if (fd_ != -1) {
+    if (log_file_) {
         sync();
-        close(fd_);
+        log_file_->Close();
     }
 }
 
-/**
- * Appends a record to the WAL file.
- * 
- * Writes the record with a newline. The write may be buffered by the OS;
- * call sync() to ensure durability.
- */
 void WAL::append(const std::string& record) {
     std::string line = record + "\n";
-    ssize_t written = write(fd_, line.data(), line.size());
-    if (written != static_cast<ssize_t>(line.size())) {
-        throw std::runtime_error("WAL write failed");
-    }
+    log_file_->Append(line);
 }
 
-/**
- * Forces all buffered WAL data to disk using fsync().
- */
 void WAL::sync() {
-    if (fd_ != -1) {
-        ::fsync(fd_);          // :: to avoid any name clash
+    if (log_file_) {
+        log_file_->Sync();
     }
 }
 
-/**
- * Replays the WAL to reconstruct the memtable.
- * 
- * Reads all records from the WAL and applies PUT/DEL operations
- * to the given memtable. Used during database recovery.
- */
 void WAL::replay(MemTable* memtable) {
-    if (lseek(fd_, 0, SEEK_SET) == -1) {
-        return;  // empty or error
+    if (!env_->FileExists(path_)) {
+        return; 
     }
 
-    char buffer[8192];
+    auto reader = env_->NewSequentialFile(path_);
+    char scratch[8192];
+    std::string buffer;
     std::string leftover;
 
     while (true) {
-        ssize_t bytes = read(fd_, buffer, sizeof(buffer));
-        if (bytes <= 0) break;                     // EOF or error
-        leftover.append(buffer, bytes);
+        reader->Read(sizeof(scratch), &buffer, scratch);
+        if (buffer.empty()) break; // EOF
+        
+        leftover.append(buffer);
 
         size_t pos = 0;
         while (true) {
@@ -98,6 +71,4 @@ void WAL::replay(MemTable* memtable) {
             }
         }
     }
-
-    // If there's a partial line left without newline, ignore it (corrupted)
 }

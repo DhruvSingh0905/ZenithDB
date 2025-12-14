@@ -9,23 +9,17 @@
 
 using namespace std::chrono_literals;
 
+// Helper to create the default PosixEnv (defined in fs_posix.cpp)
+extern std::unique_ptr<Env> NewPosixEnv();
+
 /**
- * Atomic load of shared_ptr with acquire memory ordering.
- * 
- * Ensures all writes to the pointed-to object are visible after this load.
- * Used by readers to take RCU snapshots.
+ * Atomic load/store helpers
  */
 template <typename T>
 static std::shared_ptr<T> atomic_load_ptr(const std::shared_ptr<T>* p) {
     return std::atomic_load_explicit(p, std::memory_order_acquire);
 }
 
-/**
- * Atomic store of shared_ptr with release memory ordering.
- * 
- * Ensures all writes to the pointed-to object are visible before this store.
- * Used by writers to publish new RCU snapshots.
- */
 template <typename T>
 static void atomic_store_ptr(std::shared_ptr<T>* p, std::shared_ptr<T> v) {
     std::atomic_store_explicit(p, std::move(v), std::memory_order_release);
@@ -46,13 +40,22 @@ void ZenithDB::sort_all_levels_by_min_key(Layout& layout) {
     }
 }
 
-ZenithDB::ZenithDB(const std::string& dir, bool sync_writes)
-    : data_dir_(dir),
-      sync_writes_(sync_writes),
-      manifest_(data_dir_) {
+// -----------------------------------------------------------------------------
+// Constructors
+// -----------------------------------------------------------------------------
 
-    std::filesystem::create_directories(data_dir_);
-    wal_ = std::make_unique<WAL>(data_dir_.string());
+// 1. Dependency Injection Constructor (The real initialization logic)
+ZenithDB::ZenithDB(std::unique_ptr<Env> env, const std::string& dir, bool sync_writes)
+    : data_dir_(dir),
+      env_(std::move(env)),                // 1. Init Env
+      manifest_(env_.get(), data_dir_),    // 2. Init Manifest with Env
+      sync_writes_(sync_writes) 
+{
+    // Ensure data directory exists via Env
+    env_->CreateDir(data_dir_);
+    
+    // Init WAL with Env
+    wal_ = std::make_unique<WAL>(env_.get(), data_dir_);
 
     auto mem = std::make_shared<MemTable>();
     wal_->replay(mem.get());
@@ -69,9 +72,13 @@ ZenithDB::ZenithDB(const std::string& dir, bool sync_writes)
     for (std::size_t lvl = 0; lvl < levels_meta_.size(); ++lvl) {
         for (const auto& fname : levels_meta_[lvl].files) {
             auto path = data_dir_ / fname;
-            if (!std::filesystem::exists(path)) continue;
+            
+            // Check existence via Env
+            if (!env_->FileExists(path)) continue;
+            
             try {
-                auto sst = std::make_shared<SSTable>(path);
+                // Open SSTable via Env
+                auto sst = std::make_shared<SSTable>(env_.get(), path);
                 Layout::FileEntry fe;
                 fe.sst     = sst;
                 fe.min_key = sst->meta().min_key;
@@ -87,11 +94,21 @@ ZenithDB::ZenithDB(const std::string& dir, bool sync_writes)
     worker_ = std::thread(&ZenithDB::background_worker, this);
 }
 
+// 2. Standard Constructor (Delegates to Injection Constructor)
+ZenithDB::ZenithDB(const std::string& dir, bool sync_writes)
+    : ZenithDB(NewPosixEnv(), dir, sync_writes) 
+{
+}
+
 ZenithDB::~ZenithDB() {
     stop_.store(true, std::memory_order_release);
     if (worker_.joinable()) worker_.join();
     if (wal_) wal_->sync();
 }
+
+// -----------------------------------------------------------------------------
+// Database Operations
+// -----------------------------------------------------------------------------
 
 void ZenithDB::put(const std::string& key, const std::string& value) {
     std::lock_guard<std::mutex> lk(writer_mutex_);
@@ -236,6 +253,10 @@ std::vector<std::pair<std::string, std::string>> ZenithDB::scan(
     return result;
 }
 
+// -----------------------------------------------------------------------------
+// Background Worker & Compaction
+// -----------------------------------------------------------------------------
+
 void ZenithDB::background_worker() {
     while (!stop_.load(std::memory_order_acquire)) {
         bool did_work = false;
@@ -256,13 +277,19 @@ void ZenithDB::background_worker() {
                     if (entries.empty()) { node->flushed = true; continue; }
 
                     std::string filename = new_filename(0);
-                    SSTable::create(data_dir_ / filename, entries);
+                    
+                    // PASS ENV TO CREATE
+                    SSTable::create(env_.get(), data_dir_ / filename, entries);
+                    
                     levels_meta_[0].files.push_back(filename);
                     manifest_.add_sstable(0, filename);
 
                     try {
                         if (new_layout->levels.size() < levels_meta_.size()) new_layout->levels.resize(levels_meta_.size());
-                        auto sst = std::make_shared<SSTable>(data_dir_ / filename);
+                        
+                        // PASS ENV TO CONSTRUCTOR
+                        auto sst = std::make_shared<SSTable>(env_.get(), data_dir_ / filename);
+                        
                         Layout::FileEntry fe{sst, sst->meta().min_key, sst->meta().max_key};
                         new_layout->levels[0].push_back(std::move(fe));
                     } catch (...) {}

@@ -1,13 +1,9 @@
+// src/sstable.cpp
 #include "sstable.h"
 #include <algorithm>
 #include <cstring>
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
 #include <stdexcept>
-#include <fstream>
-#include <iostream>
+#include <vector>
 
 #ifndef htole64
 #define htole64(x) (x)
@@ -18,106 +14,71 @@
 #define le32toh(x) (x)
 #endif
 
-// Constants
-static constexpr std::size_t BLOCK_TARGET_BYTES = 4096;  // Target block size (4KB, matches page size)
-static constexpr std::size_t RESTART_INTERVAL = 16;      // Restart point every 16 entries (for binary search) 
+static constexpr std::size_t BLOCK_TARGET_BYTES = 4096;
+static constexpr std::size_t RESTART_INTERVAL = 16; 
 
-/**
- * Core hash function for bloom filter (FNV-1a variant).
- * 
- * Uses FNV-1a hash algorithm, which is fast and provides good distribution.
- * This is a critical low-level optimization for bloom filter performance.
- */
 static inline std::uint64_t bloom_hash_core(std::string_view k) {
-    std::uint64_t h = 1469598103934665603ULL;  // FNV offset basis
+    std::uint64_t h = 1469598103934665603ULL; 
     for (unsigned char c : k) {
         h ^= c;
-        h *= 1099511628211ULL;  // FNV prime
+        h *= 1099511628211ULL;
     }
     return h;
 }
 
-// Now static
 std::uint64_t SSTable::bloom_hash(std::string_view k, int i) {
     std::uint64_t base = bloom_hash_core(k);
     return base + static_cast<std::uint64_t>(i) * 0x9e3779b97f4a7c15ULL;
 }
 
 bool SSTable::may_contain(std::string_view key) const {
-    if (bloom_offset_ == 0 || index_offset_ <= bloom_offset_) return true;
-    const std::size_t bloom_bytes = index_offset_ - bloom_offset_;
-    if (bloom_bytes == 0) return true;
-    const std::size_t bloom_bits = bloom_bytes * 8;
-    const unsigned char* bloom = reinterpret_cast<const unsigned char*>(data_ptr_ + bloom_offset_);
-
+    if (bloom_filter_.empty()) return true;
+    
+    std::size_t bloom_bits = bloom_filter_.size() * 8;
     for (int i = 0; i < BLOOM_HASHES; ++i) {
         std::uint64_t bit = bloom_hash(key, i) % bloom_bits;
-        if ((bloom[bit >> 3] & (1u << (bit & 7))) == 0) return false;
+        if ((bloom_filter_[bit >> 3] & (1u << (bit & 7))) == 0) return false;
     }
     return true;
 }
 
-// =====================================================================
-//  Constructor: Open and Mmap
-// =====================================================================
-
-SSTable::SSTable(const std::filesystem::path& p) {
-    // Open file for reading
-    fd_ = open(p.c_str(), O_RDONLY);
-    if (fd_ == -1) {
-        throw std::runtime_error("sstable open failed: " + p.string());
-    }
-
-    // Get file size
-    struct stat sb;
-    if (fstat(fd_, &sb) == -1) {
-        close(fd_);
-        throw std::runtime_error("sstable fstat failed");
-    }
-    data_size_ = static_cast<std::size_t>(sb.st_size);
-
-    // CRITICAL OPTIMIZATION: Memory-map the entire file for zero-copy reads.
-    // This eliminates system call overhead and enables the OS to cache pages
-    // efficiently. MAP_PRIVATE means writes don't affect the file.
-    if (data_size_ > 0) {
-        void* map = mmap(nullptr, data_size_, PROT_READ, MAP_PRIVATE, fd_, 0);
-        if (map == MAP_FAILED) {
-            close(fd_);
-            throw std::runtime_error("sstable mmap failed");
-        }
-        data_ptr_ = static_cast<char*>(map);
-    }
+SSTable::SSTable(Env* env, const std::filesystem::path& p) : env_(env) {
+    file_ = env_->NewRandomAccessFile(p);
+    meta_.file_size = env_->GetFileSize(p);
     
-    // CRITICAL FIX: Close FD immediately after mmap to avoid hitting ulimit.
-    // The mmap remains valid even after closing the FD. This prevents file
-    // descriptor exhaustion when opening many SSTables.
-    close(fd_);
-    fd_ = -1; 
-
-    if (data_size_ < FOOTER_SIZE) {
+    if (meta_.file_size < FOOTER_SIZE) {
         throw std::runtime_error("sstable too small");
     }
-
-    meta_.file_size = data_size_;
-    
-    // Parse footer and sparse index (builds in-memory index for fast lookups)
     parse_footer_and_index();
 }
 
-SSTable::~SSTable() {
-    if (data_ptr_) {
-        munmap(data_ptr_, data_size_);
+SSTable::~SSTable() = default;
+
+std::string SSTable::read_bytes(std::uint64_t offset, std::size_t n) const {
+    char scratch[4096];
+    std::string_view result;
+    
+    // If n is small, use stack scratch, otherwise alloc heap
+    std::unique_ptr<char[]> heap_buf;
+    char* buf_ptr = scratch;
+    if (n > sizeof(scratch)) {
+        heap_buf = std::make_unique<char[]>(n);
+        buf_ptr = heap_buf.get();
     }
-    // fd_ is already closed in constructor
-    if (fd_ != -1) {
-        close(fd_);
-    }
+
+    file_->Read(offset, n, &result, buf_ptr);
+    return std::string(result);
 }
 
 void SSTable::parse_footer_and_index() {
-    const char* base = data_ptr_;
-    const std::uint64_t* f = reinterpret_cast<const std::uint64_t*>(base + data_size_ - FOOTER_SIZE);
-
+    // Read footer
+    std::string footer_data = read_bytes(meta_.file_size - FOOTER_SIZE, FOOTER_SIZE);
+    const char* base = footer_data.data();
+    
+    // Decode footer
+    std::uint64_t f[4];
+    std::memcpy(f, base, FOOTER_SIZE);
+    
     data_end_     = le64toh(f[0]);
     bloom_offset_ = le64toh(f[1]);
     index_offset_ = le64toh(f[2]);
@@ -128,7 +89,16 @@ void SSTable::parse_footer_and_index() {
     index_.clear();
     meta_.entry_count = 0;
 
-    if (index_offset_ == data_size_ - FOOTER_SIZE) {
+    // Load Bloom Filter into memory
+    if (index_offset_ > bloom_offset_) {
+        std::size_t len = index_offset_ - bloom_offset_;
+        std::string bloom_raw = read_bytes(bloom_offset_, len);
+        bloom_filter_.resize(len);
+        std::memcpy(bloom_filter_.data(), bloom_raw.data(), len);
+    }
+
+    if (index_offset_ == meta_.file_size - FOOTER_SIZE) {
+        // No index
         auto all = scan("", "\xFF\xFF");
         if (!all.empty()) {
             meta_.min_key = all.front().first;
@@ -138,10 +108,11 @@ void SSTable::parse_footer_and_index() {
         return;
     }
 
-    const char* p = base + index_offset_;
-    // Safety check commented out to trust footer offset, but good to have in prod
-    // const char* limit = base + data_size_ - FOOTER_SIZE;
-
+    // Load Index
+    std::size_t idx_len = meta_.file_size - FOOTER_SIZE - index_offset_;
+    std::string index_data = read_bytes(index_offset_, idx_len);
+    const char* p = index_data.data();
+    
     std::uint32_t block_count;
     std::memcpy(&block_count, p, 4); p += 4;
     block_count = le32toh(block_count);
@@ -167,37 +138,31 @@ void SSTable::parse_footer_and_index() {
     }
 }
 
-// =====================================================================
-//  Create with Restart Points
-// =====================================================================
-
-void SSTable::create(const std::filesystem::path& path,
+void SSTable::create(Env* env, const std::filesystem::path& path,
                      const std::vector<std::pair<std::string, std::string>>& entries)
 {
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
-    if (!out) throw std::runtime_error("create failed: " + path.string());
+    auto out = env->NewWritableFile(path);
+    std::uint64_t current_offset = 0;
 
     std::string data_buf;
     std::vector<IndexEntry> index_entries;
-    std::vector<std::uint32_t> restarts;
     
     std::size_t i = 0;
     while (i < entries.size()) {
-        std::uint64_t block_start_pos = out.tellp();
+        std::uint64_t block_start_pos = current_offset;
         
         data_buf.clear();
-        restarts.clear();
-        restarts.push_back(8); // First entry starts at offset 8 (after header)
+        std::vector<std::uint32_t> restarts;
+        restarts.push_back(8); 
 
         std::uint32_t num_entries = 0;
         std::string min_key = entries[i].first;
 
-        data_buf.resize(8); // Reserve header
+        data_buf.resize(8); 
 
         while (i < entries.size()) {
             const auto& kv = entries[i];
             
-            // Add restart point every 16 entries
             if (num_entries > 0 && num_entries % RESTART_INTERVAL == 0) {
                 restarts.push_back(static_cast<std::uint32_t>(data_buf.size()));
             }
@@ -219,7 +184,6 @@ void SSTable::create(const std::filesystem::path& path,
             i++;
         }
 
-        // Write restarts block
         for (auto r : restarts) {
             std::uint32_t r_le = htole32(r);
             data_buf.append((char*)&r_le, 4);
@@ -234,39 +198,52 @@ void SSTable::create(const std::filesystem::path& path,
         std::memcpy(&data_buf[0], &n_le, 4);
         std::memcpy(&data_buf[4], &sz_le, 4);
 
-        out.write(data_buf.data(), data_buf.size());
+        out->Append(data_buf);
+        current_offset += data_buf.size();
+
         index_entries.push_back({min_key, block_start_pos});
     }
 
-    std::uint64_t data_end = out.tellp();
+    std::uint64_t data_end = current_offset;
 
     // Bloom Filter
     std::size_t total_keys = entries.size();
-    std::size_t bloom_bits = std::max<std::size_t>(total_keys * BLOOM_BITS_PER_KEY, 8);
-    std::vector<unsigned char> bloom((bloom_bits + 7) / 8, 0);
+    
+    // BUG FIX: Ensure bloom_bits is a multiple of 8 to match the reader's logic.
+    // The reader derives bits from file size (bytes * 8).
+    std::size_t raw_bits = std::max<std::size_t>(total_keys * BLOOM_BITS_PER_KEY, 8);
+    std::size_t bloom_bytes = (raw_bits + 7) / 8;
+    std::size_t bloom_bits = bloom_bytes * 8; // This must be used for modulo
+    
+    std::vector<unsigned char> bloom(bloom_bytes, 0);
     
     for (const auto& kv : entries) {
         for (int h = 0; h < BLOOM_HASHES; ++h) {
-            // FIX: Call static bloom_hash directly
             std::uint64_t bit = SSTable::bloom_hash(kv.first, h) % bloom_bits; 
             bloom[bit/8] |= (1 << (bit%8));
         }
     }
 
-    std::uint64_t bloom_offset = out.tellp();
-    out.write(reinterpret_cast<char*>(bloom.data()), bloom.size());
+    std::string bloom_str(reinterpret_cast<char*>(bloom.data()), bloom.size());
+    std::uint64_t bloom_offset = current_offset;
+    out->Append(bloom_str);
+    current_offset += bloom_str.size();
 
     // Sparse Index
-    std::uint64_t index_offset = out.tellp();
+    std::uint64_t index_offset = current_offset;
+    std::string index_buf;
     std::uint32_t count = htole32(static_cast<std::uint32_t>(index_entries.size()));
-    out.write((char*)&count, 4);
+    index_buf.append((char*)&count, 4);
+    
     for (const auto& ie : index_entries) {
         std::uint32_t klen = htole32(static_cast<std::uint32_t>(ie.min_key.size()));
-        out.write((char*)&klen, 4);
-        out.write(ie.min_key.data(), ie.min_key.size());
+        index_buf.append((char*)&klen, 4);
+        index_buf.append(ie.min_key);
         std::uint64_t off = htole64(ie.offset);
-        out.write((char*)&off, 8);
+        index_buf.append((char*)&off, 8);
     }
+    out->Append(index_buf);
+    current_offset += index_buf.size();
 
     // Footer
     std::uint64_t footer[4];
@@ -274,52 +251,40 @@ void SSTable::create(const std::filesystem::path& path,
     footer[1] = htole64(bloom_offset);
     footer[2] = htole64(index_offset);
     footer[3] = htole64(MAGIC);
-    out.write((char*)footer, FOOTER_SIZE);
+    
+    std::string footer_str((char*)footer, FOOTER_SIZE);
+    out->Append(footer_str);
+    
+    out->Sync();
+    out->Close();
 }
 
-// =====================================================================
-//  Block Search with Restarts
-// =====================================================================
-
-/**
- * Searches for a key within a data block using restart points.
- * 
- * CRITICAL OPTIMIZATION: Uses binary search on restart points to narrow
- * down the search range, then linear scans only the relevant portion.
- * This reduces average search time from O(n) to O(log(n/16) + 16).
- * 
- * Restart points are stored at the end of each block, allowing binary
- * search to find the approximate location, then linear scan from there.
- * 
- * @param offset File offset of the block
- * @param key The key to search for
- * @return Optional containing the value, or nullopt if not found
- */
 std::optional<std::string> SSTable::find_in_block(
     std::uint64_t offset,
     std::string_view key) const
 {
     if (offset + 8 > data_end_) return std::nullopt;
-    const char* bp = data_ptr_ + offset;  // Block pointer (memory-mapped)
-
-    // Read block header: [num_entries (u32)][block_size (u32)]
+    
+    // Read header to get block size
+    std::string header = read_bytes(offset, 8);
     std::uint32_t num_entries;
     std::uint32_t block_size;
-    std::memcpy(&num_entries, bp, 4); num_entries = le32toh(num_entries);
-    std::memcpy(&block_size, bp+4, 4); block_size = le32toh(block_size);
+    std::memcpy(&num_entries, header.data(), 4); num_entries = le32toh(num_entries);
+    std::memcpy(&block_size, header.data()+4, 4); block_size = le32toh(block_size);
 
     if (offset + block_size > data_end_) return std::nullopt;
 
-    // Find restart points array at end of block
+    // Read full block
+    std::string block_data = read_bytes(offset, block_size);
+    const char* bp = block_data.data();
     const char* block_end = bp + block_size;
+
     std::uint32_t num_restarts;
     std::memcpy(&num_restarts, block_end - 4, 4);
     num_restarts = le32toh(num_restarts);
 
     const char* restarts_ptr = block_end - 4 - (num_restarts * 4);
     
-    // BINARY SEARCH on restart points to find approximate location
-    // This is a critical optimization that reduces search time significantly
     std::uint32_t left = 0, right = num_restarts;
     while (left < right) {
         std::uint32_t mid = (left + right) / 2;
@@ -327,11 +292,10 @@ std::optional<std::string> SSTable::find_in_block(
         std::memcpy(&restart_off, restarts_ptr + mid*4, 4);
         restart_off = le32toh(restart_off);
 
-        // Decode key at restart point (format: [klen (u32)][key]...)
         const char* entry = bp + restart_off;
         std::uint32_t klen;
         std::memcpy(&klen, entry, 4); klen = le32toh(klen);
-        std::string_view mid_key(entry + 4, klen);  // No allocation
+        std::string_view mid_key(entry + 4, klen); 
         
         if (mid_key < key) {
             left = mid + 1;
@@ -340,36 +304,32 @@ std::optional<std::string> SSTable::find_in_block(
         }
     }
 
-    // Start linear scan from the restart point before our binary search result
     std::uint32_t start_idx = (left > 0) ? left - 1 : 0;
-    
     std::uint32_t restart_off;
     std::memcpy(&restart_off, restarts_ptr + start_idx*4, 4);
     restart_off = le32toh(restart_off);
 
-    // LINEAR SCAN from restart point (at most RESTART_INTERVAL entries)
     const char* ptr = bp + restart_off;
     const char* limit = restarts_ptr; 
 
     while (ptr < limit) {
-        // Decode entry: [klen (u32)][key][vlen (u32)][value]
         std::uint32_t klen;
         std::memcpy(&klen, ptr, 4); klen = le32toh(klen);
         ptr += 4;
-        std::string_view entry_key(ptr, klen);  // No allocation
+        std::string_view entry_key(ptr, klen); 
         ptr += klen;
 
         std::uint32_t vlen;
         std::memcpy(&vlen, ptr, 4); vlen = le32toh(vlen);
         ptr += 4;
-        std::string_view entry_val(ptr, vlen);  // No allocation
+        std::string_view entry_val(ptr, vlen); 
         ptr += vlen;
 
         int cmp = entry_key.compare(key);
-        if (cmp == 0) return std::string(entry_val);  // Found!
-        if (cmp > 0) return std::nullopt;  // Passed the key (entries are sorted)
+        if (cmp == 0) return std::string(entry_val); 
+        if (cmp > 0) return std::nullopt; 
     }
-    return std::nullopt;  // Not found
+    return std::nullopt; 
 }
 
 void SSTable::scan_block(
@@ -379,17 +339,21 @@ void SSTable::scan_block(
     std::vector<std::pair<std::string, std::string>>& out) const
 {
     if (offset + 8 > data_end_) return;
-    const char* bp = data_ptr_ + offset;
     
+    // Read header
+    std::string header = read_bytes(offset, 8);
     std::uint32_t block_size;
-    std::memcpy(&block_size, bp+4, 4); block_size = le32toh(block_size);
+    std::memcpy(&block_size, header.data()+4, 4); block_size = le32toh(block_size);
+    
+    // Read block
+    std::string block_data = read_bytes(offset, block_size);
+    const char* bp = block_data.data();
     
     const char* block_end = bp + block_size;
     std::uint32_t num_restarts;
     std::memcpy(&num_restarts, block_end - 4, 4); num_restarts = le32toh(num_restarts);
     const char* restarts_ptr = block_end - 4 - (num_restarts * 4);
 
-    // Binary search for 'start'
     std::uint32_t left = 0, right = num_restarts;
     while (left < right) {
         std::uint32_t mid = (left + right) / 2;
@@ -432,26 +396,16 @@ void SSTable::scan_block(
 }
 
 std::optional<std::string> SSTable::get(std::string_view key) const {
-    // Step 1: Bloom filter check (fast negative test)
-    // CRITICAL OPTIMIZATION: Rejects ~99% of non-existent keys with a few
-    // bit checks, avoiding expensive disk I/O and index lookups.
     if (!may_contain(key)) return std::nullopt;
     
-    // Step 2: If no sparse index, search the single block
     if (index_.empty()) return find_in_block(0, key);
 
-    // Step 3: Binary search sparse index to find relevant block
-    // CRITICAL OPTIMIZATION: Sparse index allows binary search to find
-    // the block containing the key, avoiding scanning the entire file.
     auto it = std::upper_bound(index_.begin(), index_.end(), key,
         [](std::string_view k, const IndexEntry& ie) {
             return k < ie.min_key;
         });
     
-    // If key is before first block, check first block anyway
     if (it == index_.begin()) return find_in_block(index_.front().offset, key);
-    
-    // Check the block before the upper bound (the block that might contain key)
     --it;
     return find_in_block(it->offset, key);
 }

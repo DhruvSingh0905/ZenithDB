@@ -1,15 +1,15 @@
+// src/sstable.h
 #pragma once
 
+#include "env.h"
 #include <string>
 #include <vector>
 #include <optional>
 #include <filesystem>
 #include <string_view>
 #include <cstdint>
+#include <memory>
 
-/**
- * SSTable - Memory Mapped Sorted String Table.
- */
 class SSTable {
 public:
     struct Meta {
@@ -19,13 +19,15 @@ public:
         std::size_t   entry_count;
     };
 
-    explicit SSTable(const std::filesystem::path& path);
+    // Constructor now takes Env
+    explicit SSTable(Env* env, const std::filesystem::path& path);
     ~SSTable();
 
     SSTable(const SSTable&) = delete;
     SSTable& operator=(const SSTable&) = delete;
 
-    static void create(const std::filesystem::path& path,
+    // Static creator now takes Env
+    static void create(Env* env, const std::filesystem::path& path,
                        const std::vector<std::pair<std::string, std::string>>& sorted_entries);
 
     std::optional<std::string> get(std::string_view key) const;
@@ -36,7 +38,6 @@ public:
     const Meta& meta() const { return meta_; }
     bool may_contain(std::string_view key) const;
 
-    // Made static to allow usage in create() without an instance
     static std::uint64_t bloom_hash(std::string_view k, int i);
 
 private:
@@ -45,22 +46,24 @@ private:
         std::uint64_t offset;
     };
 
+    Env* env_;
     Meta             meta_;
-    
-    int              fd_ = -1;
-    char* data_ptr_ = nullptr;
-    std::size_t      data_size_ = 0;
+    std::unique_ptr<RandomAccessFile> file_;
 
     std::uint64_t    data_end_     = 0;
     std::uint64_t    bloom_offset_ = 0;
     std::uint64_t    index_offset_ = 0;
 
     std::vector<IndexEntry> index_;
+    std::vector<unsigned char> bloom_filter_; 
 
     static constexpr std::size_t BLOOM_BITS_PER_KEY = 10;
     static constexpr int         BLOOM_HASHES       = 7;
     static constexpr std::uint64_t MAGIC            = 0xDB55CA1EULL;
     static constexpr std::size_t   FOOTER_SIZE      = 32;
+
+    // Helper to read bytes from random access file
+    std::string read_bytes(std::uint64_t offset, std::size_t n) const;
 
     std::optional<std::string> find_in_block(std::uint64_t offset,
                                              std::string_view key) const;
