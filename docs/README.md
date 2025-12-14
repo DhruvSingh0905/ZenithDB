@@ -1,665 +1,183 @@
-# ZenithDB Documentation
+# ZenithDB
 
-## Overview
+**A Distributed, CRDT-Based Key-Value Store for RL-Driven Replication Research.**
 
-ZenithDB is a high-performance, embedded key-value database engine implementing the Log-Structured Merge Tree (LSM-tree) architecture. It is designed for write-heavy workloads with excellent read performance through intelligent caching and indexing strategies. This implementation focuses on low-level optimizations to achieve maximum performance while maintaining code clarity.
+ZenithDB is a specialized storage engine designed to bridge the gap between **distributed systems** and **machine learning**. Unlike traditional databases that use static consistency models (e.g., Raft for strong consistency or Dynamo for eventual consistency), ZenithDB is architected to allow an embedded **Reinforcement Learning (RL) agent** to dynamically tune replication strategies per key-range.
 
-## Table of Contents
+The system guarantees data convergence via **Conflict-Free Replicated Data Types (CRDTs)**, allowing the control policy to optimize purely for latency, bandwidth, and staleness without risking data safety.
 
-1. [Architecture Overview](#architecture-overview)
-2. [Core Components](#core-components)
-3. [Low-Level Optimizations](#low-level-optimizations)
-4. [Design Decisions](#design-decisions)
-5. [Performance Characteristics](#performance-characteristics)
-6. [Known Deficits](#known-deficits)
-7. [API Reference](#api-reference)
-8. [Building and Usage](#building-and-usage)
-9. [Benchmarking](#benchmarking)
+---
 
-## Architecture Overview
+## 🚀 Key Features
 
-ZenithDB follows the LSM-tree design pattern, similar to LevelDB and RocksDB. The architecture consists of several key layers optimized for both write and read performance.
+### Distributed & Consistent
+* **Leaderless Architecture:** A master-less, shared-nothing topology where any node can accept reads and writes.
+* **Strong Eventual Consistency:** Implements **State-based CRDTs** (Vector Clocks + Last-Write-Wins Registers) to ensure that all nodes converge to the same state eventually, regardless of message ordering or network partitions.
+* **Semantic Compaction:** The LSM-tree compaction engine was rewritten to *merge* conflicting versions of data rather than discarding them, preserving causal history during background operations.
 
-### Write Path
+### Storage Engine
+* **LSM-Tree Backend:** High-throughput write engine using MemTables (SkipList) and SSTables (Sorted String Tables).
+* **Decoupled Storage (VFS):** Implements a `Env` abstraction layer, allowing the engine to run on:
+    * **POSIX Filesystem:** Standard local disk storage.
+    * **MockEnv:** In-memory storage for deterministic simulation and testing.
+    * **Cloud Object Storage:** (Future) Direct mapping to S3/GCS.
+* **Performance Optimizations:**
+    * **Bloom Filters:** 10 bits/key to minimize disk lookups for non-existent keys.
+    * **Lock-Free Reads:** Uses RCU (Read-Copy-Update) for snapshot isolation.
+    * **Memory-Mapped I/O:** Zero-copy access to data blocks.
 
-1. **Writes** → Active MemTable (in-memory, skip list)
-2. **WAL** → Write-Ahead Log (durability guarantee)
-3. **MemTable Freeze** → When size exceeds threshold, memtable becomes immutable
-4. **Background Flush** → Immutable memtables are written to Level 0 SSTables
-5. **Compaction** → SSTables are merged and moved to deeper levels
+### Research Capabilities
+* **Hybrid Replication:** Supports two distinct replication modes that the agent can switch between:
+    * **Eager Replication:** Immediate push-to-replica for low-latency reads.
+    * **Lazy Gossip:** Background anti-entropy for bandwidth efficiency.
+* **Instrumentation:** Built-in metrics for write rates, conflict rates, and latency to feed the RL reward function.
 
-### Read Path
+---
 
-1. **Active MemTable** → Check first (most recent data)
-2. **Immutable MemTables** → Check lock-free chain (recent data)
-3. **SSTables** → Search from Level 0 to deeper levels
-   - Use range metadata to skip irrelevant files
-   - Use bloom filters to quickly reject files
-   - Use sparse index to find relevant blocks
-   - Binary search on restart points within blocks
-
-### Key Features
-
-- **Lock-free reads** using RCU (Read-Copy-Update) semantics
-- **Memory-mapped SSTables** for zero-copy reads
-- **Range pruning** to skip irrelevant memtables and SSTables
-- **Bloom filters** for fast negative lookups (10 bits/key, 7 hash functions)
-- **Block-based storage** with restart points for efficient binary search
-- **Background compaction** to reduce read amplification
-- **Write-ahead logging** for durability
-
-## Core Components
-
-### 1. ZenithDB (`db.h` / `db.cpp`)
-
-The main database class that coordinates all components.
-
-**Key Responsibilities:**
-- Manages active and immutable memtables
-- Coordinates WAL writes
-- Maintains RCU layout snapshots for lock-free reads
-- Runs background worker thread for flushing and compaction
-- Provides public API (put, get, remove, scan)
-
-**Important Data Structures:**
-- `Layout`: RCU snapshot of on-disk SSTable layout
-- `ImmNode`: Lock-free linked list of immutable memtables
-- `Level`: Metadata about SSTable files in each level
-
-### 2. MemTable (`memtable.h` / `memtable.cpp`)
-
-In-memory sorted key-value store using lock-free skip list with arena allocator.
-
-**Features:**
-- Fast O(log n) insertions and lookups (skip list)
-- Lock-free reads for better concurrent performance
-- Zero memory fragmentation (arena allocator)
-- Range tracking (min_key, max_key) for pruning
-- Accurate size tracking via arena memory usage
-- Tombstone support (empty value = deleted)
-- **Critical Optimization**: Arena allocator eliminates heap fragmentation and reduces allocation overhead
-- **Critical Optimization**: Skip list provides better cache locality than balanced trees
-
-**Implementation:**
-- Uses `SkipList` for sorted key-value storage
-- Uses `Arena` allocator for all memory allocations
-- All nodes and key/value data allocated from arena (contiguous memory)
-
-**Lifecycle:**
-1. Created as active memtable
-2. Filled with writes
-3. Frozen when size exceeds threshold (2x limit = 100KB)
-4. Added to immutable chain (lock-free)
-5. Flushed to disk by background worker
-6. Eventually garbage collected (currently not reclaimed - see deficits)
-
-### 3. SSTable (`sstable.h` / `sstable.cpp`)
-
-Immutable on-disk file format for persistent storage with memory-mapped access.
-
-**File Layout:**
-```
-[Data Blocks] [Bloom Filter] [Sparse Index] [Footer]
-```
-
-**Data Block Format:**
-- Header: `[num_entries (u32)][block_size (u32)]`
-- Entries: `[key_len (u32)][key][value_len (u32)][value]...`
-- Restart Points: `[restart_offset (u32)]...` (every 16 entries)
-- Footer: `[num_restarts (u32)]`
-
-**Sparse Index:**
-- Maps block min_key → block offset
-- Enables binary search to find relevant blocks
-- Stored at end of file for efficient access
-
-**Bloom Filter:**
-- 10 bits per key, 7 hash functions
-- Quick negative test (no false negatives)
-- Uses FNV-1a hash algorithm for fast computation
-- Stored after data blocks
-
-**Footer:**
-- `[data_end (u64)][bloom_offset (u64)][index_offset (u64)][magic (u64)]`
-- Magic number: `0xDB55CA1E` for integrity checking
-
-**Critical Optimizations:**
-- Memory-mapped files for zero-copy reads
-- File descriptor closed immediately after mmap to prevent FD exhaustion
-- Binary search on restart points within blocks (O(log(n/16)) instead of O(n))
-- Little-endian encoding for cross-platform compatibility
-
-### 4. WAL (`wal.h` / `wal.cpp`)
-
-Write-Ahead Log for durability.
-
-**Format:**
-- Each line: `PUT|key|value` or `DEL|key|`
-- Append-only log file: `wal.log`
-
-**Operations:**
-- `append()`: Write record to WAL (buffered)
-- `sync()`: Force to disk (fsync)
-- `replay()`: Reconstruct memtable from WAL on startup
-
-**Recovery:**
-- Reads entire WAL on startup
-- Applies all PUT/DEL operations to memtable
-- Ensures no data loss after crashes
-
-### 5. Manifest (`manifest.h` / `manifest.cpp`)
-
-Tracks which SSTable files belong to which level.
-
-**Format:**
-- Each line: `ADD <level> <filename>` or `DEL <level> <filename>`
-- Append-only log file: `MANIFEST`
-
-**Usage:**
-- Updated on every flush and compaction
-- Replayed on startup to reconstruct level structure
-- Only ADD records are processed during recovery (DEL records ignored)
-
-### 6. BlockCache (`block_cache.h`)
-
-Global LRU cache for SSTable file contents (currently not used - see deficits).
-
-**Features:**
-- Singleton pattern
-- Thread-safe operations
-- Default capacity: 16MB
-- Evicts least recently used entries when full
-
-**Key:** File path (e.g., `"data/L0_1234567890_1.sst"`)
-**Value:** `shared_ptr<string>` containing entire file contents
-
-### 7. Compaction (`compaction.cpp`)
-
-Background process that merges SSTables.
-
-**Policy:**
-- Level 0: Compact when ≥ 3 files
-- Level 1+: Compact when ≥ 4 files
-- Merges all files in level into next level
-- Removes duplicates (keeps latest)
-- Drops tombstones for deleted keys
-
-**Three-Phase Process:**
-1. **Plan** (locked): Check thresholds, create compaction task
-2. **Execute** (unlocked): Merge SSTables, write new file (I/O heavy)
-3. **Apply** (locked): Update manifest, metadata, and layout
-
-**Benefits:**
-- Reduces read amplification
-- Reclaims space from deleted keys
-- Maintains sorted order
-
-## Low-Level Optimizations
-
-This section highlights the critical low-level optimizations implemented in ZenithDB that contribute to its performance.
-
-### 1. RCU (Read-Copy-Update) for Lock-Free Reads
-
-**Implementation:**
-- Uses `std::shared_ptr` with atomic operations for layout snapshots
-- Readers: `atomic_load_explicit(..., memory_order_acquire)`
-- Writers: `atomic_store_explicit(..., memory_order_release)`
-- Old snapshots remain valid until all readers release them
-
-**Benefits:**
-- Zero lock contention for reads
-- High read concurrency
-- Simple implementation with automatic memory management
-
-**Memory Ordering:**
-- Acquire semantics ensure all writes to layout are visible after load
-- Release semantics ensure all writes to layout are visible before store
-- Prevents data races without explicit locks
-
-### 2. Memory-Mapped SSTable Files
-
-**Implementation:**
-- Uses `mmap()` with `MAP_PRIVATE` flag
-- File descriptor closed immediately after mmap to prevent FD exhaustion
-- Entire file mapped into virtual memory
-
-**Benefits:**
-- Zero-copy reads (no system call overhead)
-- OS handles page caching automatically
-- Efficient memory usage (pages loaded on demand)
-- Prevents file descriptor exhaustion (critical for many SSTables)
-
-**Trade-offs:**
-- Memory usage grows with number of open SSTables
-- OS manages eviction (not application-controlled)
-
-### 3. Arena Allocator for Zero-Fragmentation Memory Management
-
-**Implementation:**
-- Custom `Arena` class allocates memory in 4KB blocks
-- All memtable allocations (nodes, keys, values) from arena
-- Sequential allocations from current block (O(1) for most allocations)
-- Memory freed only when arena destroyed (no individual deallocation)
-
-**Benefits:**
-- Zero memory fragmentation (all allocations from contiguous blocks)
-- Fast allocations (O(1) pointer increment vs O(log n) heap allocation)
-- Cache-friendly (sequential allocations improve cache locality)
-- Accurate memory tracking (atomic counter for concurrent reads)
-- Reduced allocation overhead (no free list traversal)
-
-**Example:**
-```cpp
-Arena arena;
-char* key = arena.Allocate(key_size);  // O(1) allocation
-// Memory freed when arena destroyed
-```
-
-### 4. Lock-Free Skip List for MemTable Storage
-
-**Implementation:**
-- Custom `SkipList` class replaces std::map in MemTable
-- Multiple sorted linked lists at different "levels"
-- Probabilistic height (1/4 chance per level, average ~1.33)
-- Atomic pointer operations for thread-safe reads
-- All nodes allocated from arena
-
-**Benefits:**
-- Lock-free reads (better concurrent read performance)
-- O(log n) average-case operations (insert, lookup)
-- Better cache locality than balanced trees
-- Reduced memory overhead (variable-height nodes)
-- Arena-allocated (zero fragmentation)
-
-**Skip List Structure:**
-- Higher levels skip over more nodes
-- Search starts at highest level, drops down when key passed
-- Average height: O(log n) with good balance
-
-### 5. Range Pruning
-
-**Implementation:**
-- Each memtable tracks `min_key` and `max_key`
-- Each SSTable stores `min_key` and `max_key` in metadata
-- Readers check key range before searching
-
-**Benefits:**
-- Skips entire data structures when key is outside range
-- Reduces unnecessary comparisons
-- Particularly effective for range scans
-
-### 6. Bloom Filters
-
-**Implementation:**
-- 10 bits per key, 7 hash functions
-- Uses FNV-1a hash algorithm (fast, good distribution)
-- Stored after data blocks in SSTable
-
-**Benefits:**
-- Fast negative test (~99% rejection rate)
-- Avoids expensive disk I/O and index lookups
-- Small memory overhead (~1.25 bytes per key)
-
-**Algorithm:**
-- For each key, compute 7 hash values
-- Set corresponding bits in bloom filter
-- On lookup, check all 7 bits (if any is 0, key definitely not present)
-
-### 7. Sparse Block Indexing
-
-**Implementation:**
-- One index entry per data block (maps min_key → block offset)
-- Stored at end of SSTable file
-- Binary search to find relevant block
-
-**Benefits:**
-- Reduces search space from entire file to single block
-- O(log(blocks)) instead of O(entries)
-- Small index size (typically < 1% of file size)
-
-### 8. Restart Points for Block Search
-
-**Implementation:**
-- Every 16 entries, store a restart point (offset to full key)
-- Restart points stored at end of block
-- Binary search on restart points, then linear scan
-
-**Benefits:**
-- O(log(n/16) + 16) instead of O(n) for block search
-- Reduces average search time significantly
-- Minimal storage overhead (4 bytes per restart point)
-
-**Algorithm:**
-1. Binary search restart points to find approximate location
-2. Linear scan from restart point (at most 16 entries)
-3. Early termination when key passed (entries are sorted)
-
-### 9. Little-Endian Encoding
-
-**Implementation:**
-- All multi-byte integers stored in little-endian format
-- Uses `htole64()` / `le64toh()` macros for conversion
-- Ensures cross-platform compatibility
-
-**Benefits:**
-- Works on both little-endian and big-endian systems
-- No runtime byte-order detection needed
-- Consistent file format across platforms
-
-### 10. Atomic Operations for Immutable Chain
-
-**Implementation:**
-- Immutable memtables stored in lock-free linked list
-- Head pointer: `std::atomic<ImmNode*>`
-- Insertion: `compare_exchange_weak()` with memory ordering
-
-**Benefits:**
-- Lock-free traversal for readers
-- No blocking during memtable freezing
-- Simple implementation with standard atomics
-
-### 11. Copy-on-Write Layout Updates
-
-**Implementation:**
-- Writers create new Layout (copy of old)
-- Modify new Layout
-- Atomically publish new Layout
-- Old Layout remains valid until all readers release
-
-**Benefits:**
-- Readers never see inconsistent state
-- No locking required for reads
-- Automatic memory management via `shared_ptr`
-
-## Design Decisions
-
-### Why LSM-tree?
-
-LSM-trees excel at write-heavy workloads because:
-- Writes are sequential (append-only)
-- No random disk I/O for writes
-- Reads can be optimized with caching and indexing
-- Natural support for time-ordered data
-
-### Why RCU for Reads?
-
-Read-Copy-Update enables:
-- Lock-free reads (no blocking on writes)
-- High read concurrency
-- Simple implementation with `shared_ptr` and atomic operations
-- Automatic memory reclamation
-
-### Why Multi-level Compaction?
-
-- Level 0: Small, recent data (may overlap)
-- Level 1+: Larger, sorted, non-overlapping files
-- Gradual migration from hot to cold data
-- Bounded read amplification
-
-### Why Bloom Filters?
-
-- Fast negative tests (skip files that don't contain key)
-- Small memory overhead (~10 bits per key)
-- No false negatives (only false positives)
-- Critical for reducing read amplification
-
-### Why Block-based Storage?
-
-- Efficient I/O (read entire blocks)
-- Better cache utilization
-- Enables sparse indexing
-- Matches page size (4KB) for optimal performance
-
-### Why Memory-Mapped Files?
-
-- Zero-copy reads (no system call overhead)
-- OS handles page caching
-- Efficient memory usage (pages loaded on demand)
-- Prevents file descriptor exhaustion
-
-## Performance Characteristics
-
-### Write Performance
-
-- **Latency:** ~1-10 microseconds (memtable write + WAL)
-- **Throughput:** 100K-1M writes/sec (depends on value size)
-- **Amplification:** ~1x (write once to memtable, once to WAL)
-
-**Bottlenecks:**
-- Single writer mutex limits write throughput (see deficits)
-- WAL sync can cause latency spikes when enabled (configurable via constructor)
-
-### Read Performance
-
-- **Point Lookup:**
-  - Memtable hit: ~100 nanoseconds
-  - SSTable hit: ~1-10 microseconds (with memory mapping)
-  - SSTable miss: ~10-100 microseconds (disk I/O)
-
-- **Range Scan:**
-  - Depends on range size and data distribution
-  - Uses range pruning to skip irrelevant files
-  - Merges results from multiple sources
-
-**Optimizations:**
-- Lock-free reads (RCU)
-- Range pruning
-- Bloom filters
-- Sparse indexing
-- Restart points
-
-### Space Efficiency
-
-- **Overhead:**
-  - WAL: ~1x data size (until flushed)
-  - SSTable: ~10 bits/key (bloom filter) + index overhead
-  - Compaction: Temporary 2x space during merge
-
-- **Amplification:**
-  - Write: ~1x (memtable + WAL)
-  - Read: ~1-3x (check multiple levels)
-  - Space: ~1.1-1.5x (bloom filter + index overhead)
-
-### Concurrency
-
-- **Reads:** Fully concurrent (lock-free, RCU)
-- **Writes:** Thread-safe but serialized (mutex-protected)
-- **Background:** Runs in separate thread
-
-**Scalability:**
-- Reads scale linearly with number of threads (lock-free)
-- Writes: Multiple threads supported, but serialized via mutex (see deficits)
-
-## Known Deficits
-
-This section documents known limitations and areas where the implementation could be improved. These are acknowledged trade-offs made for simplicity and clarity.
-
-### 1. Serialized Writes via Mutex
-
-**Status:** Multiple write threads are supported, but writes are serialized through a mutex.
-
-**Implementation:** 
-- Multiple threads can call `put()` and `remove()` concurrently
-- All write operations are serialized via `writer_mutex_` for thread safety
-- Writes are thread-safe but not parallel (mutex serialization)
-
-**Impact:** Write throughput is limited by mutex contention in high-concurrency scenarios.
-
-**Why:** Design choice for simplicity and correctness. Serialized writes ensure:
-- Consistent ordering of writes
-- Simpler WAL management
-- Easier correctness reasoning
-- Thread-safe API without requiring external synchronization
-
-**Note:** The implementation supports concurrent write calls (as demonstrated in main.cpp stress test), but the mutex ensures only one write executes at a time. True parallel writes would require partitioning keys across multiple memtables and more complex coordination.
-
-### 2. ImmNode Memory Leak
-
-**Issue:** Immutable memtable nodes are never reclaimed from the lock-free chain.
-
-**Impact:** Memory usage grows over time (though memtables are eventually flushed and can be freed).
-
-**Why:** Epoch-based reclamation is complex. Current implementation prioritizes simplicity.
-
-**Workaround:** In practice, memtables are small and flushed quickly, so impact is minimal.
-
-### 3. No Compression
-
-**Issue:** SSTables are stored uncompressed.
-
-**Impact:** Higher disk usage and I/O bandwidth requirements.
-
-**Why:** Compression adds complexity and CPU overhead. Can be added later without changing core architecture.
-
-### 4. Simple Compaction Policy
-
-**Issue:** Compacts entire level at once when threshold is met.
-
-**Impact:** Can cause write amplification and temporary space usage spikes.
-
-**Why:** Simpler than tiered or leveled compaction. Works well for most workloads.
-
-**Better Approach:** Tiered compaction (merge smaller files first) or leveled compaction (merge overlapping files).
-
-### 5. BlockCache Not Used
-
-**Issue:** BlockCache is implemented but not integrated into SSTable reads.
-
-**Impact:** Missing opportunity for additional caching layer.
-
-**Why:** Memory-mapped files already provide OS-level caching. BlockCache would add complexity with marginal benefit.
-
-### 6. No Transaction Support
-
-**Issue:** No ACID guarantees across multiple keys.
-
-**Impact:** Cannot perform atomic multi-key operations.
-
-**Why:** Adds significant complexity (MVCC, locking, conflict resolution).
-
-### 7. Limited Error Recovery
-
-**Issue:** Corrupted SSTables are skipped with minimal logging.
-
-**Impact:** Data loss may go unnoticed.
-
-**Why:** Prioritizes performance over comprehensive error handling.
-
-**Better Approach:** Checksums, more detailed logging, repair utilities.
-
-### 8. WAL Sync Configuration
-
-**Status:** WAL sync is now configurable via constructor parameter.
-
-**Implementation:** 
-- Default: `sync_writes = false` (buffered writes, synced on shutdown)
-- Option: `sync_writes = true` (synced on every write for durability)
-
-**Trade-off:** 
-- Async writes: Lower latency, small risk of data loss on crash
-- Sync writes: Higher latency, guaranteed durability
-
-### 9. No Column Families
-
-**Issue:** All data stored in single namespace.
-
-**Impact:** Cannot isolate different data types or access patterns.
-
-**Why:** Adds complexity to compaction and metadata management.
-
-### 10. Fixed Memtable Size Threshold
-
-**Issue:** Memtable size threshold is hardcoded (100KB).
-
-**Impact:** Not tunable for different workloads.
-
-**Why:** Simplifies implementation. Can be made configurable.
-
-## API Reference
-
-### Constructor
-
-```cpp
-ZenithDB db("data");                    // Creates database with async WAL writes (default)
-ZenithDB db("data", true);              // Creates database with sync WAL writes (durable)
-```
-
-### Write Operations
-
-```cpp
-// Insert or update a key-value pair
-db.put("key1", "value1");
-
-// Delete a key
-db.remove("key1");
-```
-
-### Read Operations
-
-```cpp
-// Point lookup
-auto value = db.get("key1");
-if (value) {
-    std::cout << *value << std::endl;
-}
-
-// Range scan (inclusive)
-auto results = db.scan("key1", "key100");
-for (const auto& [key, val] : results) {
-    std::cout << key << " -> " << val << std::endl;
-}
-```
-
-## Building and Usage
+## 🛠️ Building and Running
 
 ### Prerequisites
+* **C++ Compiler:** GCC 10+ or Clang 12+ (C++20 support required).
+* **CMake:** Version 3.20 or higher.
+* **GoogleTest:** Included via Git submodule.
 
-- C++20 compiler (GCC 10+, Clang 12+, MSVC 2019+)
-- CMake 3.20+
-- Filesystem library support
-- POSIX-compliant system (for mmap, file I/O)
-
-### Build
+### Build Instructions
 
 ```bash
+# 1. Clone the repository
+git clone [https://github.com/yourusername/zenithdb.git](https://github.com/yourusername/zenithdb.git)
+cd zenithdb
+
+# 2. Configure the build
 mkdir build && cd build
 cmake ..
-make
-```
 
-### Run REPL
+# 3. Compile (Release mode recommended for benchmarking)
+make -j$(nproc)
 
-```bash
-./zenithdb
-```
 
-Commands:
-- `put <key> <value>` - Insert/update
-- `get <key>` - Lookup
-- `del <key>` - Delete
-- `scan [<start> [<end>]]` - Range scan
-- `exit` - Quit
+\# API Usage
 
-### Run Benchmarks
+ZenithDB provides a clean C++ API for simulating distributed clusters or running a single node.
 
-```bash
-./zenithdb_bench
-```
+\## Basic Single-Node Usage
 
-### Run Tests
+\`\`\`cpp
 
-```bash
-./tests
-```
+#include "db.h"
 
-## Benchmarking
+// Initialize DB with a unique Node ID (for vector clocks)
 
-See the [Benchmarking Guide](BENCHMARKING.md) for detailed performance analysis and comparison with other databases.
+ZenithDB db("./data\_dir", "node\_1");
 
-## License
+// Write (implicitly adds local vector clock)
 
-[Add your license here]
+db.put("user:100", "Alice");
 
-## Contributing
+// Read
 
-[Add contribution guidelines here]
+auto val = db.get("user:100");
+
+if (val) {
+
+std::cout << "Value: " << \*val << std::endl;
+
+}
+
+Distributed Cluster Simulation
+
+Simulate a networked cluster within a single process using MockTransport and Node wrappers.
+
+cpp
+
+Copy code
+
+#include "node.h"
+
+#include "transport.h"
+
+int main() {
+
+// 1. Setup the simulated network
+
+MockTransport transport;
+
+// 2. Create Nodes (ID, Directory, Transport)
+
+auto nodeA = std::make\_unique("A", "./db\_A", &transport);
+
+auto nodeB = std::make\_unique("B", "./db\_B", &transport);
+
+// 3. Peer Discovery
+
+nodeA->AddPeer("B");
+
+nodeB->AddPeer("A");
+
+// 4. Client Write to Node A
+
+// Node A writes locally, then replicates to B (Eager strategy)
+
+nodeA->Put("key\_1", "Value\_X");
+
+// 5. Simulate Network Delivery
+
+transport.DeliverAll();
+
+// 6. Read from Node B (Converged)
+
+auto result = nodeB->Get("key\_1");
+
+assert(\*result == "Value\_X");
+
+return 0;
+
+}
+
+Architecture Details
+
+The Merge Pipeline
+
+Unlike standard key-value stores that simply overwrite data on PUT, ZenithDB implements a read-repair merge pipeline.
+
+An incoming write arrives with a payload consisting of a value and its associated vector clock.
+
+The engine performs a local read to retrieve the existing vector clock for the key, if one exists.
+
+A causal comparison is then executed:
+
+If the incoming vector clock strictly dominates the local clock, the incoming value overwrites the local value.
+
+If the local vector clock dominates the incoming clock, the write is ignored to ensure idempotency.
+
+If the clocks are concurrent, a deterministic tie-break is applied (lexicographical ordering) and the vector clocks are merged.
+
+The resulting winning value is persisted by appending it to the write-ahead log (WAL) and inserting it into the MemTable.
+
+File Format
+
+The write-ahead log (WAL) is an append-only log of serialized CRDT entries.
+
+SSTables consist of sorted blocks containing serialized records in the following format:
+
+css
+
+Copy code
+
+\[VectorClock Length\]\[VectorClock Bytes\]\[Value\]
+
+For deeper discussion of system topology, compaction, and storage layout, refer to docs/ARCHITECTURE.md.
+
+Project Roadmap
+
+Phase 1 focuses on the core engine and safety guarantees, including the LSM-tree implementation, vector clocks, last-write-wins registers, and merge-based compaction. This phase is complete.
+
+Phase 2 introduces the foundational plumbing layer, including the node abstraction, message bus, and gossip or eager replication logic. This phase is complete.
+
+Phase 3 adds the adaptive intelligence layer, consisting of a reinforcement learning controller, bandit algorithms such as epsilon-greedy selection, and a formalized reward function. This phase is currently in progress.
+
+Phase 4 will focus on large-scale simulation, using realistic traces to train and evaluate the learning agent. This phase is planned.
+
+License
+
+This project is licensed under the MIT License
