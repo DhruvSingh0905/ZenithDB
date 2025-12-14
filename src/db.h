@@ -1,4 +1,3 @@
-// src/db.h
 #pragma once
 
 #include "memtable.h"
@@ -28,10 +27,18 @@ public:
 
     void put(const std::string& key, const std::string& value);
     void put(const std::string& key, const LWWRegister& crdt);
+    
     std::optional<std::string> get(std::string_view key) const;
     void remove(const std::string& key);
 
     std::vector<std::pair<std::string, std::string>> scan(
+        std::string_view start = "",
+        std::string_view end   = "\xFF\xFF") const;
+
+    // --- NEW: Raw CRDT Access for Replication ---
+    std::optional<LWWRegister> get_crdt(std::string_view key) const;
+    
+    std::vector<std::pair<std::string, LWWRegister>> scan_crdt(
         std::string_view start = "",
         std::string_view end   = "\xFF\xFF") const;
 
@@ -68,10 +75,7 @@ private:
     
     // Initialized first
     std::unique_ptr<Env> env_;
-    
-    // Changed to pointer to control initialization order
     std::unique_ptr<Manifest> manifest_;
-    
     std::unique_ptr<WAL> wal_;
     std::vector<Level> levels_meta_;
 

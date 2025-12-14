@@ -1,4 +1,3 @@
-// src/db.cpp
 #include "db.h"
 #include "crdt.h"
 #include <algorithm>
@@ -48,10 +47,7 @@ ZenithDB::ZenithDB(std::unique_ptr<Env> env, const std::string& dir, const std::
       sync_writes_(sync_writes),
       node_id_(node_id)
 {
-    // 1. Ensure directory exists BEFORE creating Manifest/WAL
     env_->CreateDir(data_dir_);
-    
-    // 2. Now safe to initialize Manifest and WAL
     manifest_ = std::make_unique<Manifest>(env_.get(), data_dir_);
     wal_ = std::make_unique<WAL>(env_.get(), data_dir_);
 
@@ -59,7 +55,6 @@ ZenithDB::ZenithDB(std::unique_ptr<Env> env, const std::string& dir, const std::
     wal_->replay(mem.get());
     atomic_store_ptr(&active_mem_, mem);
 
-    // Use -> for manifest_
     auto loaded = manifest_->load();
     std::size_t level_count = std::max<std::size_t>(7, loaded.size());
     levels_meta_ = std::move(loaded);
@@ -72,7 +67,6 @@ ZenithDB::ZenithDB(std::unique_ptr<Env> env, const std::string& dir, const std::
         for (const auto& fname : levels_meta_[lvl].files) {
             auto path = data_dir_ / fname;
             if (!env_->FileExists(path)) continue;
-            
             try {
                 auto sst = std::make_shared<SSTable>(env_.get(), path);
                 Layout::FileEntry fe;
@@ -107,7 +101,10 @@ ZenithDB::~ZenithDB() {
 
 void ZenithDB::put(const std::string& key, const std::string& value) {
     std::lock_guard<std::mutex> lk(writer_mutex_);
+    
+    // 1. Advance Local Clock (Causality for new local write)
     local_clock_.increment(node_id_);
+    
     LWWRegister reg(value, local_clock_);
     std::string serialized = reg.serialize();
 
@@ -131,10 +128,30 @@ void ZenithDB::put(const std::string& key, const std::string& value) {
     }
 }
 
-void ZenithDB::put(const std::string& key, const LWWRegister& crdt) {
+// FIX: Read-Modify-Write for Incoming Replication
+void ZenithDB::put(const std::string& key, const LWWRegister& incoming_crdt) {
     std::lock_guard<std::mutex> lk(writer_mutex_);
-    local_clock_.merge(crdt.clock);
-    std::string serialized = crdt.serialize();
+    
+    // 1. Merge clocks to track causal history from peer
+    local_clock_.merge(incoming_crdt.clock);
+    
+    // 2. Resolve Conflict (Read existing -> Merge -> Write winner)
+    LWWRegister final_crdt = incoming_crdt;
+    
+    // We can call get_crdt() even while holding writer_mutex_ because 
+    // get_crdt only uses atomic loads (RCU), no locks.
+    auto existing_opt = get_crdt(key);
+    
+    if (existing_opt) {
+        // Merge logic: 'final_crdt' becomes the winner
+        final_crdt.merge(*existing_opt);
+        
+        // Optimization: If the winner is identical to what we already have,
+        // we can skip the write to avoid log growth (optional but good).
+        // For simplicity/safety in this phase, we just write the winner.
+    }
+
+    std::string serialized = final_crdt.serialize();
     
     auto mem = atomic_load_ptr(&active_mem_);
     if (!mem) { mem = std::make_shared<MemTable>(); atomic_store_ptr(&active_mem_, mem); }
@@ -160,7 +177,27 @@ void ZenithDB::remove(const std::string& key) {
     put(key, "");
 }
 
+std::vector<std::pair<std::string, std::string>> ZenithDB::scan(std::string_view start, std::string_view end) const {
+    auto crdt_list = scan_crdt(start, end);
+    std::vector<std::pair<std::string, std::string>> out;
+    out.reserve(crdt_list.size());
+    for(auto& kv : crdt_list) {
+        out.emplace_back(kv.first, kv.second.value);
+    }
+    return out;
+}
+
 std::optional<std::string> ZenithDB::get(std::string_view key) const {
+    auto crdt = get_crdt(key);
+    if (!crdt) return std::nullopt;
+    return crdt->value;
+}
+
+// -----------------------------------------------------------------------------
+// NEW: Raw CRDT Access
+// -----------------------------------------------------------------------------
+
+std::optional<LWWRegister> ZenithDB::get_crdt(std::string_view key) const {
     std::string raw_serialized_value;
     bool found = false;
 
@@ -209,17 +246,18 @@ std::optional<std::string> ZenithDB::get(std::string_view key) const {
 
 deserialize:
     if (!found) return std::nullopt;
-    LWWRegister reg = LWWRegister::deserialize(raw_serialized_value);
+    auto reg = LWWRegister::deserialize(raw_serialized_value);
     if (reg.value.empty()) return std::nullopt;
-    return reg.value;
+    return reg;
 }
 
-std::vector<std::pair<std::string, std::string>> ZenithDB::scan(
+std::vector<std::pair<std::string, LWWRegister>> ZenithDB::scan_crdt(
     std::string_view start, std::string_view end) const
 {
     std::vector<std::pair<std::string, std::string>> raw_results;
     if (start > end) return {};
 
+    // Collect Raw
     {
         auto mem = atomic_load_ptr(&active_mem_);
         if (mem) {
@@ -247,15 +285,17 @@ std::vector<std::pair<std::string, std::string>> ZenithDB::scan(
         }
     }
 
+    // Sort by Key
     std::sort(raw_results.begin(), raw_results.end(), 
         [](const auto& a, const auto& b) { return a.first < b.first; });
 
-    std::vector<std::pair<std::string, std::string>> final_results;
+    std::vector<std::pair<std::string, std::string>> final_raw;
+    // Merge Logic (Last Write Wins)
     for (const auto& kv : raw_results) {
-        if (final_results.empty() || final_results.back().first != kv.first) {
-            final_results.push_back(kv);
+        if (final_raw.empty() || final_raw.back().first != kv.first) {
+            final_raw.push_back(kv);
         } else {
-            std::string& existing_raw = final_results.back().second;
+            std::string& existing_raw = final_raw.back().second;
             const std::string& incoming_raw = kv.second;
             LWWRegister existing = LWWRegister::deserialize(existing_raw);
             LWWRegister incoming = LWWRegister::deserialize(incoming_raw);
@@ -264,15 +304,16 @@ std::vector<std::pair<std::string, std::string>> ZenithDB::scan(
         }
     }
 
-    std::vector<std::pair<std::string, std::string>> cleaned_results;
-    cleaned_results.reserve(final_results.size());
-    for (const auto& kv : final_results) {
+    // Deserialize and filter
+    std::vector<std::pair<std::string, LWWRegister>> out;
+    out.reserve(final_raw.size());
+    for (const auto& kv : final_raw) {
         LWWRegister reg = LWWRegister::deserialize(kv.second);
         if (!reg.value.empty()) {
-            cleaned_results.emplace_back(kv.first, reg.value);
+            out.emplace_back(kv.first, std::move(reg));
         }
     }
-    return cleaned_results;
+    return out;
 }
 
 // -----------------------------------------------------------------------------
@@ -301,7 +342,7 @@ void ZenithDB::background_worker() {
                     std::string filename = new_filename(0);
                     SSTable::create(env_.get(), data_dir_ / filename, entries);
                     levels_meta_[0].files.push_back(filename);
-                    manifest_->add_sstable(0, filename); // Use ->
+                    manifest_->add_sstable(0, filename);
 
                     try {
                         if (new_layout->levels.size() < levels_meta_.size()) new_layout->levels.resize(levels_meta_.size());
