@@ -1,3 +1,4 @@
+// src/db.h
 #pragma once
 
 #include "memtable.h"
@@ -6,6 +7,7 @@
 #include "manifest.h"
 #include "level.h"
 #include "env.h"
+#include "crdt.h"
 
 #include <atomic>
 #include <filesystem>
@@ -19,27 +21,13 @@
 
 class ZenithDB {
 public:
-    /**
-     * Dependency Injection Constructor.
-     * * Allows passing a custom Environment (e.g., MockEnv for testing, S3Env for cloud).
-     * Takes ownership of the Env pointer.
-     * * @param env Unique pointer to the Environment implementation
-     * @param dir Directory path for database files
-     * @param sync_writes If true, syncs WAL to disk on every write
-     */
-    ZenithDB(std::unique_ptr<Env> env, const std::string& dir, bool sync_writes = false);
-
-    /**
-     * Standard Constructor.
-     * * Creates a standard PosixEnv (local disk) and delegates to the main constructor.
-     * * @param dir Directory path for database files (default: "data")
-     * @param sync_writes If true, syncs WAL to disk on every write (default: false)
-     */
-    explicit ZenithDB(const std::string& dir = "data", bool sync_writes = false);
+    ZenithDB(std::unique_ptr<Env> env, const std::string& dir, const std::string& node_id, bool sync_writes = false);
+    explicit ZenithDB(const std::string& dir = "data", const std::string& node_id = "node1", bool sync_writes = false);
     
     ~ZenithDB();
 
     void put(const std::string& key, const std::string& value);
+    void put(const std::string& key, const LWWRegister& crdt);
     std::optional<std::string> get(std::string_view key) const;
     void remove(const std::string& key);
 
@@ -77,11 +65,13 @@ private:
     std::atomic<ImmNode*> immut_head_{nullptr};
 
     std::filesystem::path data_dir_;
-
-    // CRITICAL: env_ must be declared before manifest_ and wal_ so it is initialized first.
+    
+    // Initialized first
     std::unique_ptr<Env> env_;
-
-    Manifest manifest_;
+    
+    // Changed to pointer to control initialization order
+    std::unique_ptr<Manifest> manifest_;
+    
     std::unique_ptr<WAL> wal_;
     std::vector<Level> levels_meta_;
 
@@ -90,16 +80,16 @@ private:
     mutable std::mutex writer_mutex_;
     bool sync_writes_;
 
+    std::string node_id_;
+    VectorClock local_clock_; 
+
     static const std::size_t MEMTABLE_LIMIT = 50 * 1024;
 
     void background_worker();
-    
     std::optional<CompactionTask> plan_compaction(const Layout& layout);
     void execute_compaction(CompactionTask& task);
     void apply_compaction(const CompactionTask& task, Layout& new_layout);
-    
     std::string new_filename(int level);
-
     static void sort_level_by_min_key(Layout& layout, std::size_t level);
     static void sort_all_levels_by_min_key(Layout& layout);
 };

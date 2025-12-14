@@ -36,7 +36,7 @@ target_link_libraries(zenithdb PRIVATE zenithdb_lib)
 # Tests
 # ------------------------------
 add_executable(tests
-    tests/test_vfs.cpp
+    tests/test_crdt_phase1.cpp
 
 
 )

@@ -1,4 +1,3 @@
-// src/main.cpp
 #include "db.h"
 #include <iostream>
 #include <sstream>
@@ -16,13 +15,10 @@ void writer_thread(ZenithDB& db, int id, int count) {
 }
 
 int main() {
-    // Example usage: 
-    // ZenithDB db("mydb", true); // true for synchronous writes (slower, safer)
-    // ZenithDB db("mydb", false); // false for buffered writes (faster)
-    
-    ZenithDB db("mydb", false); // Default to fast/buffered
+    // Updated constructor: dir="mydb", node_id="node1", sync=false
+    ZenithDB db("mydb", "node1", false); 
 
-    std::cout << "ZenithDB Console\n";
+    std::cout << "ZenithDB Console (Node: node1)\n";
     std::cout << "Commands: put <key> <value> | get <key> | del <key> | scan [<start> [<end>]] | stress | exit\n";
 
     std::string line;
